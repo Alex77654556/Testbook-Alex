@@ -13,7 +13,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from typing import Optional, List, Dict, Any
 from urllib.parse import quote
 
-app = FastAPI(title="Testbook Mirror", version="29.0.0")
+app = FastAPI(title="Testbook Mirror", version="30.0.0")
 
 BASE_URL = "https://testbook.com"
 API_BASE = "https://api.testbook.com"
@@ -64,7 +64,7 @@ def validate_jwt(token: str):
 def get_user_info(token: str) -> dict:
     p = decode_jwt_payload(token) or {}
     return {"name": p.get("name") or "User", "email": p.get("email") or "",
-            "isPaid": p.get("isPaidUser", False), "sub": p.get("sub") or ""}
+            "isPaid": p.get("isPaidUser", False)}
 
 def tb_headers(token: str, json_accept: bool = True) -> Dict[str, str]:
     return {
@@ -111,9 +111,7 @@ async def fetch_series_list(token: str) -> List[Dict]:
 def is_series_or_section(o):
     if not isinstance(o, dict): return False
     k = set(o.keys())
-    if "branches" in k and "examStages" in k: return True
-    if "subsections" in k and "superSectionId" in k: return True
-    return False
+    return ("branches" in k and "examStages" in k) or ("subsections" in k and "superSectionId" in k)
 
 def find_all_tests(node: Any, out: List[dict], depth: int = 0):
     if depth > 15: return
@@ -123,8 +121,7 @@ def find_all_tests(node: Any, out: List[dict], depth: int = 0):
         if not is_series_or_section(node):
             keys = set(node.keys())
             if ("id" in keys or "_id" in keys) and ("title" in keys or "name" in keys):
-                markers = {"questionCount", "totalQuestions", "duration", "totalMark", "totalMarks", "testType"}
-                if keys & markers:
+                if keys & {"questionCount", "totalQuestions", "duration", "totalMark", "totalMarks", "testType"}:
                     out.append(node)
         for v in node.values():
             if isinstance(v, (list, dict)): find_all_tests(v, out, depth + 1)
@@ -156,78 +153,139 @@ async def fetch_all_tests_for_series(token: str, series_id: str) -> List[Dict]:
     except Exception: return []
 
 # ==========================================
-# FOCUSED QUESTION FETCH — DUMP ALL BODIES
+# FOCUSED: Section-wise questions fetching
 # ==========================================
-async def probe_question_endpoints(token: str, test_id: str) -> Dict:
-    """Probe all question endpoints, dump actual response bodies."""
+async def get_full_instructions(token: str, test_id: str) -> Optional[dict]:
+    """Fetch the /instructions endpoint - has sections."""
     s = quote(test_id, safe="")
-    result = {"tried": [], "questions": [], "winner": None}
-    
-    # GET endpoints
-    get_urls = [
-        f"{API_BASE}/api/v2_1/tests/{s}",
-        f"{API_BASE}/api/v2/tests/{s}",
-        f"{API_BASE}/api/v2_1/tests/{s}/question-paper",
-        f"{API_BASE}/api/v2_1/tests/{s}/paper",
-        f"{API_BASE}/api/v2_1/tests/{s}/questions",
-        f"{API_BASE}/api/v2_1/tests/{s}/start",
-        f"{API_BASE}/api/v2_1/tests/{s}/attempt",
-        f"{API_BASE}/api/v2_1/tests/{s}/instructions",
-        f"{API_BASE}/api/v2_1/tests/{s}/details",
-        f"{API_BASE}/api/v2_1/tests/{s}/data",
-        f"{API_BASE}/api/v2_1/tests/{s}/test-data",
-        f"{API_BASE}/api/v2_1/question-paper/{s}",
-        f"{API_BASE}/api/v2_1/questionPapers/{s}",
-        f"{API_BASE}/api/v2_1/paper/{s}",
-        f"{API_BASE}/api/v2_1/test-attempt/{s}",
-        f"{API_BASE}/api/v2_1/testAttempt/{s}",
-        f"{API_BASE}/api/v2_1/attempts/{s}",
-    ]
-    # POST endpoints (start attempt)
-    post_urls = [
-        (f"{API_BASE}/api/v2_1/tests/{s}/start", {}),
-        (f"{API_BASE}/api/v2_1/tests/{s}/start", {"testId": test_id}),
-        (f"{API_BASE}/api/v2_1/tests/{s}/attempt", {}),
-        (f"{API_BASE}/api/v2_1/tests/{s}/attempt", {"testId": test_id}),
-        (f"{API_BASE}/api/v2_1/attempts", {"testId": test_id}),
-        (f"{API_BASE}/api/v2_1/attempts", {"test_id": test_id}),
-        (f"{API_BASE}/api/v2_1/live-panel/tests/{s}/start", {}),
-        (f"{API_BASE}/api/v2_1/live-panel/tests/{s}/start", {"testId": test_id}),
-        (f"{API_BASE}/api/v2_1/live-panel/attempt", {"testId": test_id}),
-        (f"{API_BASE}/api/v2_1/live-panel/attempt", {"tsid": test_id}),
-        (f"{API_BASE}/api/v2/attempts", {"testId": test_id}),
-    ]
+    url = f"{API_BASE}/api/v2_1/tests/{s}/instructions"
+    full = f"{url}?auth_code={quote(token, safe='')}&language=english"
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(full, headers=tb_headers(token))
+            if r.status_code == 200:
+                j = r.json()
+                if j.get("success"): return j.get("data", {})
+    except Exception: pass
+    return None
 
+def build_question_urls(test_id: str, section_id: str = "") -> List[str]:
+    s = quote(test_id, safe="")
+    sec = quote(section_id, safe="") if section_id else ""
+    urls = []
+    # Section-based
+    if sec:
+        for ep in ("questions", "question-paper", "paper", "question-paper-pdf"):
+            urls.append(f"{API_BASE}/api/v2_1/tests/{s}/sections/{sec}/{ep}")
+            urls.append(f"{API_BASE}/api/v2_1/tests/{s}/section/{sec}/{ep}")
+            urls.append(f"{API_BASE}/api/v2_1/tests/{s}/{ep}?sectionId={sec}")
+            urls.append(f"{API_BASE}/api/v2_1/sections/{sec}/{ep}")
+            urls.append(f"{API_BASE}/api/v2_1/sections/{sec}/questions")
+        # question-paper with both
+        urls.append(f"{API_BASE}/api/v2_1/tests/{s}/questionPaper?sectionId={sec}")
+        urls.append(f"{API_BASE}/api/v2_1/questionPaper/{s}?sectionId={sec}")
+        urls.append(f"{API_BASE}/api/v2_1/question-paper/{s}/{sec}")
+    # Test-level
+    for ep in ("questions", "question-paper", "paper", "questionPaper",
+               "question-papers", "questionPapers", "get-questions",
+               "question-paper-pdf", "questions-pdf", "question-list"):
+        urls.append(f"{API_BASE}/api/v2_1/tests/{s}/{ep}")
+        urls.append(f"{API_BASE}/api/v2_1/{ep}/{s}")
+    # Attempt-based
+    urls.append(f"{API_BASE}/api/v2_1/tests/{s}/attempt/questions")
+    urls.append(f"{API_BASE}/api/v2_1/tests/{s}/attempt/data")
+    urls.append(f"{API_BASE}/api/v2_1/tests/{s}/attempt")
+    # v2
+    for ep in ("questions", "question-paper"):
+        urls.append(f"{API_BASE}/api/v2/tests/{s}/{ep}")
+    # Test-series/live-panel pattern
+    urls.append(f"{API_BASE}/api/v2_1/live-panel/tests/{s}/questions")
+    urls.append(f"{API_BASE}/api/v2_1/live-panel/tests/{s}/question-paper")
+    return urls
+
+def extract_questions(node, out, depth=0):
+    if depth > 15: return
+    if isinstance(node, list):
+        for x in node: extract_questions(x, out, depth + 1)
+    elif isinstance(node, dict):
+        keys = set(node.keys())
+        has_q = "question" in keys or "questionText" in keys or "questionEn" in keys
+        has_opts = "options" in keys or "choices" in keys or "option" in keys or "answerOptions" in keys
+        if has_q:
+            opts_raw = node.get("options") or node.get("choices") or node.get("answerOptions") or []
+            opts = []
+            if isinstance(opts_raw, list):
+                for o in opts_raw:
+                    if isinstance(o, dict):
+                        opts.append(str(o.get("text") or o.get("value") or o.get("option") or o.get("answer") or str(o)))
+                    else: opts.append(str(o))
+            out.append({
+                "text": str(node.get("question") or node.get("questionText") or node.get("questionEn") or ""),
+                "options": opts,
+                "correctAnswer": node.get("correctAnswer") or node.get("answer") or "",
+            })
+        for v in node.values():
+            if isinstance(v, (list, dict)): extract_questions(v, out, depth + 1)
+
+async def fetch_questions_all(token: str, test_id: str) -> Dict:
+    """Try everything — returns dict with full data for debugging."""
+    result = {"questions": [], "winner": None, "tried": [], "test_detail": None,
+              "instructions": None, "section_ids": []}
+
+    # 1. Fetch full test detail
+    s = quote(test_id, safe="")
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(f"{API_BASE}/api/v2_1/tests/{s}?auth_code={quote(token, safe='')}&language=english", headers=tb_headers(token))
+            if r.status_code == 200:
+                j = r.json()
+                if j.get("success"): result["test_detail"] = j.get("data", {})
+    except Exception: pass
+
+    # 2. Fetch instructions (has sections)
+    instr = await get_full_instructions(token, test_id)
+    result["instructions"] = instr
+    if instr:
+        sections = instr.get("sections", [])
+        for sec in sections:
+            sid = sec.get("_id") or sec.get("id")
+            if sid: result["section_ids"].append(sid)
+
+    # 3. Try section-wise question endpoints
+    urls = build_question_urls(test_id, "")
+    # Add section-wise
+    for sec_id in result["section_ids"]:
+        urls.extend(build_question_urls(test_id, sec_id))
+
+    # Try all in parallel
     async with httpx.AsyncClient(follow_redirects=True, timeout=8.0) as client:
-        # GET first
-        async def do_get(u):
+        async def try_url(u):
             full = f"{u}{'&' if '?' in u else '?'}auth_code={quote(token, safe='')}&language=english"
             try:
                 r = await client.get(full, headers=tb_headers(token))
-                body = r.text[:500] if r.status_code != 404 else ""
-                return {"method": "GET", "url": u, "status": r.status_code, "body": body}
+                body = r.text[:800] if r.status_code != 404 else ""
+                if r.status_code == 200:
+                    try:
+                        j = r.json()
+                        qs = []
+                        extract_questions(j, qs)
+                        return {"url": u, "status": 200, "questions": qs, "body": body}
+                    except Exception:
+                        return {"url": u, "status": 200, "questions": [], "body": body}
+                return {"url": u, "status": r.status_code, "questions": [], "body": body}
             except Exception as e:
-                return {"method": "GET", "url": u, "status": -1, "body": str(e)[:150]}
+                return {"url": u, "status": -1, "questions": [], "body": str(e)[:100]}
 
-        async def do_post(u, body):
-            full = f"{u}?auth_code={quote(token, safe='')}&language=english"
-            try:
-                r = await client.request("POST", full, headers=tb_headers(token), json=body)
-                body_txt = r.text[:500] if r.status_code != 404 else ""
-                return {"method": "POST", "url": u, "status": r.status_code, "body": body_txt, "req_body": body}
-            except Exception as e:
-                return {"method": "POST", "url": u, "status": -1, "body": str(e)[:150], "req_body": body}
-
-        tasks = [do_get(u) for u in get_urls] + [do_post(u, b) for u, b in post_urls]
+        tasks = [try_url(u) for u in urls]
         results = await asyncio.gather(*tasks, return_exceptions=True)
-        
         for res in results:
             if isinstance(res, Exception): continue
-            result["tried"].append({
-                "method": res["method"], "url": res["url"],
-                "status": res["status"], "body": res["body"][:250],
-                "req_body": res.get("req_body"),
-            })
+            result["tried"].append({"url": res["url"], "status": res["status"],
+                                    "qcount": len(res["questions"]),
+                                    "body_preview": res["body"][:250]})
+            if res["questions"] and not result["winner"]:
+                result["winner"] = res["url"]
+                result["questions"] = res["questions"]
 
     return result
 
@@ -296,6 +354,38 @@ border-top-color:#4f46e5;border-radius:50%;animation:spin .8s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
 .loading-box{text-align:center;padding:50px 20px}
 .loading-box p{margin-top:16px;color:#718096;font-size:14px}
+/* Quiz UI */
+.quiz-header{background:#fff;border-radius:14px;padding:16px;margin-bottom:14px;
+box-shadow:0 2px 10px rgba(0,0,0,.06);position:sticky;top:66px;z-index:50}
+.quiz-header h2{font-size:15px;font-weight:700;color:#1a202c;margin-bottom:8px}
+.quiz-meta{display:flex;justify-content:space-between;font-size:12px;color:#718096}
+.timer{font-weight:700;color:#4f46e5}
+.q-card{background:#fff;border-radius:14px;padding:18px;margin-bottom:14px;
+box-shadow:0 2px 10px rgba(0,0,0,.06);border-top:3px solid #4f46e5}
+.q-num{display:inline-block;background:#4f46e5;color:#fff;font-size:11px;
+font-weight:700;padding:4px 10px;border-radius:8px;margin-bottom:10px}
+.q-text{font-size:15px;line-height:1.65;color:#2d3748;margin-bottom:14px;white-space:pre-wrap}
+.opt{display:block;padding:13px 16px;background:#f7fafc;border-radius:10px;
+margin-bottom:10px;font-size:14px;color:#2d3748;border:2px solid #e2e8f0;
+cursor:pointer;transition:all .15s;user-select:none}
+.opt:hover{border-color:#a5b4fc;background:#f0f4ff}
+.opt.selected{border-color:#4f46e5;background:#eef2ff;font-weight:600}
+.opt.correct{border-color:#10b981;background:#d1fae5}
+.opt.wrong{border-color:#ef4444;background:#fee2e2}
+.opts-letter{display:inline-block;width:24px;height:24px;line-height:24px;
+text-align:center;background:#e2e8f0;border-radius:50%;font-size:12px;
+font-weight:700;margin-right:10px;color:#4a5568}
+.opt.selected .opts-letter{background:#4f46e5;color:#fff}
+.quiz-footer{background:#fff;border-radius:14px;padding:16px;margin-top:18px;
+box-shadow:0 2px 10px rgba(0,0,0,.06);display:flex;gap:10px;flex-wrap:wrap}
+.quiz-footer button{flex:1;min-width:120px;padding:13px;border:none;border-radius:10px;
+font-size:14px;font-weight:700;cursor:pointer}
+.submit-btn{background:#10b981;color:#fff}
+.reset-btn{background:#e2e8f0;color:#4a5568}
+.result-box{background:linear-gradient(135deg,#4f46e5,#7c3aed);color:#fff;
+padding:24px;border-radius:14px;text-align:center;margin-bottom:18px}
+.result-box .score{font-size:42px;font-weight:900;margin:8px 0}
+.result-box .lbl{font-size:13px;opacity:.9}
 """
 
 def shell(title: str, body: str) -> str:
@@ -339,7 +429,7 @@ __ERROR__
 
 # ---------- Routes ----------
 @app.get("/health")
-async def health(): return {"status":"ok","version":"29.0.0"}
+async def health(): return {"status":"ok","version":"30.0.0"}
 
 @app.get("/", response_class=HTMLResponse)
 async def root(error: Optional[str] = None,
@@ -436,8 +526,7 @@ async def series_page(id: str = Query(...),
           document.getElementById('loading').style.display = 'none';
           const box = document.getElementById('results');
           if (!data.tests || data.tests.length === 0) {{
-            box.innerHTML = '<div class="empty"><h2>😕 Tests load nahi ho paye</h2>' +
-              '<p>' + (data.error || 'Koi test nahi mila') + '</p></div>';
+            box.innerHTML = '<div class="empty"><h2>😕 Tests nahi mile</h2></div>';
             return;
           }}
           let html = '<div class="section-title">📝 Tests (' + data.tests.length + ')</div><div class="row">';
@@ -447,16 +536,11 @@ async def series_page(id: str = Query(...),
             if (t.duration) meta.push('⏱ ' + t.duration + ' min');
             if (t.totalMarks) meta.push('🎯 ' + t.totalMarks + ' marks');
             html += '<div class="card"><a href="/test?id=' + encodeURIComponent(t.id) + '&name=' + encodeURIComponent(t.title) + '">' +
-              '<h3>' + t.title + '</h3>' +
-              '<p>' + meta.join(' · ') + '</p>' +
+              '<h3>' + t.title + '</h3><p>' + meta.join(' · ') + '</p>' +
               '<span class="badge green">Start Test →</span></a></div>';
           }}
           html += '</div>';
           box.innerHTML = html;
-        }})
-        .catch(e => {{
-          document.getElementById('loading').style.display = 'none';
-          document.getElementById('results').innerHTML = '<div class="empty"><h2>Error</h2><p>' + e + '</p></div>';
         }});
     </script>"""
     return HTMLResponse(shell(title, body))
@@ -469,8 +553,6 @@ async def api_series_tests(id: str = Query(...),
     try:
         tests = await asyncio.wait_for(fetch_all_tests_for_series(token, id), timeout=30.0)
         return {"tests": tests, "count": len(tests)}
-    except asyncio.TimeoutError:
-        return {"tests": [], "error": "Timeout"}
     except Exception as e:
         return {"tests": [], "error": str(e)}
 
@@ -500,15 +582,11 @@ async def test_page(id: str = Query(...), name: str = Query(""),
             return;
           }}
           renderQuiz(data.questions);
-        }})
-        .catch(e => {{
-          document.getElementById('loading').style.display = 'none';
-          document.getElementById('quiz').innerHTML = '<div class="empty"><h2>Error</h2><p>' + e + '</p></div>';
         }});
       function renderQuiz(questions) {{
         window.__answers = {{}}; window.__questions = questions;
         let html = '<div class="quiz-header"><h2>' + {json.dumps(title)} + '</h2>' +
-          '<div class="quiz-meta"><span>📝 Total: ' + questions.length + ' questions</span>' +
+          '<div class="quiz-meta"><span>📝 Total: ' + questions.length + '</span>' +
           '<span class="timer" id="answered">Answered: 0</span></div></div>';
         questions.forEach((q, i) => {{
           html += '<div class="q-card"><span class="q-num">Q' + (i+1) + '</span>' +
@@ -521,15 +599,13 @@ async def test_page(id: str = Query(...), name: str = Query(""),
           }});
           html += '</div>';
         }});
-        html += '<div class="quiz-footer">' +
-          '<button class="submit-btn" onclick="submitQuiz(' + questions.length + ')">✅ Submit Test</button>' +
+        html += '<div class="quiz-footer"><button class="submit-btn" onclick="submitQuiz(' + questions.length + ')">✅ Submit</button>' +
           '<button class="reset-btn" onclick="window.location.reload()">🔄 Reset</button></div>';
         document.getElementById('quiz').innerHTML = html;
       }}
       function selectOption(el, q, o) {{
         document.querySelectorAll('.opt[data-q="' + q + '"]').forEach(a => a.classList.remove('selected'));
-        el.classList.add('selected');
-        window.__answers[q] = o;
+        el.classList.add('selected'); window.__answers[q] = o;
         document.getElementById('answered').textContent = 'Answered: ' + Object.keys(window.__answers).length;
       }}
       function submitQuiz(total) {{
@@ -568,14 +644,12 @@ async def api_test_questions(id: str = Query(...),
     token = get_token(session_cookie)
     if not token: return JSONResponse({"error": "not logged in", "questions": []}, status_code=401)
     try:
-        result = await asyncio.wait_for(probe_question_endpoints(token, id), timeout=30.0)
-        return {"questions": result.get("questions", []), "count": len(result.get("questions", []))}
-    except asyncio.TimeoutError:
-        return {"questions": [], "error": "Timeout"}
+        result = await asyncio.wait_for(fetch_questions_all(token, id), timeout=35.0)
+        return {"questions": result["questions"], "count": len(result["questions"])}
     except Exception as e:
         return {"questions": [], "error": str(e)}
 
-# ---------- FULL DEBUG: dump ALL bodies ----------
+# ---------- Debug: FULL section dump ----------
 @app.get("/debug/probe", response_class=HTMLResponse)
 async def probe(session_cookie: Optional[str] = Cookie(None, alias="tb_session")):
     token = get_token(session_cookie)
@@ -600,34 +674,72 @@ async def probe(session_cookie: Optional[str] = Cookie(None, alias="tb_session")
                     lines.append(f"ID: {test_id}")
                     lines.append("")
 
-                    result = await probe_question_endpoints(token, test_id)
-                    lines.append(f"=== ALL BODIES (250 chars) ===\n")
+                    # Get full test detail
+                    s = quote(test_id, safe="")
+                    detail_resp = await client.get(f"{API_BASE}/api/v2_1/tests/{s}?auth_code={quote(token, safe='')}&language=english", headers=tb_headers(token))
+                    detail = detail_resp.json().get("data", {})
+                    lines.append(f"=== /tests/{test_id} — DETAIL KEYS ===")
+                    lines.append(f"Keys: {list(detail.keys())}")
+                    for k in list(detail.keys()):
+                        v = detail[k]
+                        if isinstance(v, list): lines.append(f"  [{k}] list len={len(v)}")
+                        elif isinstance(v, dict): lines.append(f"  [{k}] dict keys={list(v.keys())[:10]}")
+                        else: lines.append(f"  [{k}] = {str(v)[:100]}")
+                    lines.append("")
 
-                    for t in result["tried"]:
-                        st = t["status"]
-                        if st == 200:
-                            lines.append(f"✅ [{st}] {t['method']}  {t['url'][:95]}")
-                        elif st in (400, 401, 403, 405):
-                            lines.append(f"⚠️  [{st}] {t['method']}  {t['url'][:95]}")
-                        elif st == 0:
-                            lines.append(f"💥 [ERR] {t['method']}  {t['url'][:95]}")
-                        else:
-                            continue  # skip 404s
-                        if t.get("req_body"):
-                            lines.append(f"      REQ: {json.dumps(t['req_body'], ensure_ascii=False)[:150]}")
-                        if t["body"]:
-                            lines.append(f"      BODY: {t['body'][:220]}")
+                    # Sections detail
+                    secs = detail.get("sections", [])
+                    if secs:
+                        lines.append(f"=== SECTIONS ({len(secs)}) ===")
+                        for i, sec in enumerate(secs[:3]):
+                            lines.append(f"\nSection {i}:")
+                            lines.append(f"  keys: {list(sec.keys())}")
+                            lines.append(f"  sample: {json.dumps(sec, ensure_ascii=False)[:500]}")
                         lines.append("")
 
-                    # Summary
-                    lines.append("=== SUMMARY ===")
-                    for st in [200, 400, 401, 403, 405, 500]:
-                        count = sum(1 for x in result["tried"] if x["status"] == st)
-                        if count: lines.append(f"  Status {st}: {count} URLs")
+                    # Get instructions
+                    instr_resp = await client.get(f"{API_BASE}/api/v2_1/tests/{s}/instructions?auth_code={quote(token, safe='')}&language=english", headers=tb_headers(token))
+                    instr = instr_resp.json().get("data", {})
+                    lines.append(f"=== /tests/{test_id}/instructions — KEYS ===")
+                    lines.append(f"Keys: {list(instr.keys())}")
+                    for k in list(instr.keys()):
+                        v = instr[k]
+                        if isinstance(v, list): lines.append(f"  [{k}] list len={len(v)}")
+                        elif isinstance(v, dict): lines.append(f"  [{k}] dict keys={list(v.keys())[:15]}")
+                        else: lines.append(f"  [{k}] = {str(v)[:150]}")
+                    lines.append("")
+
+                    # Sections from instructions
+                    instr_secs = instr.get("sections", [])
+                    if instr_secs:
+                        lines.append(f"=== INSTRUCTION SECTIONS ({len(instr_secs)}) ===")
+                        for i, sec in enumerate(instr_secs[:2]):
+                            lines.append(f"\nSection {i} keys: {list(sec.keys())}")
+                            lines.append(f"  sample: {json.dumps(sec, ensure_ascii=False)[:600]}")
+                            # Try each section for question ids
+                            sec_id = sec.get("_id") or sec.get("id")
+                            if sec_id:
+                                lines.append(f"  Section ID: {sec_id}")
+                        lines.append("")
+
+                    # Now try all question URLs
+                    result = await fetch_questions_all(token, test_id)
+                    lines.append(f"=== ALL QUESTION ENDPOINTS TRIED ({len(result['tried'])}) ===")
+                    lines.append(f"Section IDs detected: {result['section_ids']}")
+                    lines.append("")
+
+                    for t in result["tried"]:
+                        if t["status"] in (200, 400, 401, 403, 405):
+                            lines.append(f"[{t['status']}] q={t['qcount']}  {t['url'][:100]}")
+                            if t["qcount"] > 0:
+                                lines.append(f"   🎯 WINNER — {t['qcount']} QUESTIONS!")
+                            elif t.get("body_preview"):
+                                lines.append(f"   BODY: {t['body_preview'][:200]}")
+                            lines.append("")
     except Exception as e:
         lines.append(f"ERR: {e}")
 
     body = f"""<a href="/dashboard" class="back-btn">← Back</a>
-    <div class="info-box">🎯 Question endpoints — ALL bodies dumped, no 404 spam</div>
+    <div class="info-box">🔬 FULL DEBUG — sections, instructions, question endpoints</div>
     <div class="debug">{chr(10).join(lines)}</div>"""
-    return HTMLResponse(shell("Debug", body))
+    return HTMLResponse(shell("Full Debug", body))

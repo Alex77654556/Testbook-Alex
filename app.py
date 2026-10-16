@@ -10,10 +10,10 @@ from fastapi import FastAPI, Form, Cookie, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from bs4 import BeautifulSoup
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Any
 from urllib.parse import quote
 
-app = FastAPI(title="Testbook Mirror", version="12.0.0")
+app = FastAPI(title="Testbook Mirror", version="13.0.0")
 
 BASE_URL = "https://testbook.com"
 API_BASE = "https://api.testbook.com"
@@ -68,11 +68,7 @@ def validate_jwt(token: str):
 
 def get_user_info(token: str) -> dict:
     p = decode_jwt_payload(token) or {}
-    return {
-        "name": p.get("name") or "User",
-        "email": p.get("email") or "",
-        "userId": p.get("sub") or "",
-    }
+    return {"name": p.get("name") or "User", "email": p.get("email") or ""}
 
 def tb_headers(token: str, json_accept: bool = True) -> Dict[str, str]:
     return {
@@ -123,145 +119,144 @@ async def fetch_series_list(token: str) -> List[Dict]:
                     "slug": str(d.get("slug") or ""),
                     "title": str(d.get("name") or "Test Series"),
                     "description": str(d.get("description") or "")[:200],
-                    "totalTests": d.get("totalTests") or 0,
                 })
             return results
     except Exception as e:
         print("series list error:", e)
         return []
 
-# ---------- Series detail ----------
-def find_tests_loose(node, out, depth=0):
-    """Loose matcher — id + name, and includes some test-like key."""
-    if depth > 10:
+# ---------- Recursive test finder ----------
+def find_all_tests(node: Any, out: List[dict], depth: int = 0):
+    """Find every object that looks like a test."""
+    if depth > 12:
         return
     if isinstance(node, list):
         for x in node:
-            find_tests_loose(x, out, depth + 1)
+            find_all_tests(x, out, depth + 1)
     elif isinstance(node, dict):
         keys = set(node.keys())
-        has_id = ("id" in keys) or ("_id" in keys)
-        has_name = ("name" in keys) or ("title" in keys)
-        test_hints = keys & {"questionCount", "totalQuestions", "questionsCount",
-                             "duration", "totalTime", "totalMarks", "marks",
-                             "questions", "totalMarks", "testType", "test_type",
-                             "maxMarks", "time", "questionsCount", "totalQuestionsCount"}
-        # Also accept if object has 'testId' or 'test_id'
-        is_test = has_id and has_name and (test_hints or "testType" in keys)
-        if is_test:
+        has_id = "id" in keys or "_id" in keys
+        has_name = "name" in keys or "title" in keys
+        # Common test markers
+        test_markers = {"questionCount", "totalQuestions", "questionsCount", "totalMarks",
+                        "maxMarks", "duration", "totalTime", "testType", "test_type",
+                        "questions", "marks", "time", "totalQuestionsCount",
+                        "testAttempted", "isAttempted", "attempted"}
+        if has_id and has_name and (keys & test_markers):
             out.append(node)
         for v in node.values():
             if isinstance(v, (list, dict)):
-                find_tests_loose(v, out, depth + 1)
+                find_all_tests(v, out, depth + 1)
 
-async def fetch_series_detail(token: str, series_id: str) -> tuple[Optional[Dict], List[Dict], Dict]:
-    """Return (series_info, tests, debug)."""
+def normalize_tests(raw: List[dict]) -> List[Dict]:
+    seen, result = set(), []
+    for t in raw:
+        tid = str(t.get("id") or t.get("_id") or t.get("testId") or "")
+        if not tid or tid in seen:
+            continue
+        seen.add(tid)
+        result.append({
+            "id": tid,
+            "title": str(t.get("name") or t.get("title") or "Test"),
+            "questionCount": (t.get("questionCount") or t.get("totalQuestions")
+                              or t.get("questionsCount") or t.get("questions")
+                              or t.get("totalQuestionsCount") or 0),
+            "duration": t.get("duration") or t.get("totalTime") or t.get("time") or 0,
+            "totalMarks": t.get("totalMarks") or t.get("marks") or t.get("maxMarks") or 0,
+            "testType": t.get("testType") or t.get("test_type") or "",
+        })
+    return result
+
+# ---------- Series detail ----------
+async def fetch_series_tests(token: str, series_id: str) -> tuple[List[Dict], Dict, Optional[Dict]]:
+    """Return (tests, debug, series_info)."""
     url = f"{API_BASE}/api/v2_1/test-series/{quote(series_id, safe='')}?auth_code={quote(token, safe='')}&language=english"
-    debug = {"url": url, "status": 0, "tests_found": 0, "raw_preview": ""}
+    debug = {"url": url, "status": 0, "structure": {}, "tests_found": 0}
     try:
         async with httpx.AsyncClient(timeout=20.0) as client:
             r = await client.get(url, headers=tb_headers(token))
             debug["status"] = r.status_code
             if r.status_code != 200:
                 debug["error"] = r.text[:300]
-                return None, [], debug
+                return [], debug, None
             j = r.json()
             if not j.get("success"):
                 debug["error"] = json.dumps(j)[:300]
-                return None, [], debug
-
+                return [], debug, None
             data = j.get("data", {})
-            debug["raw_preview"] = json.dumps(data, ensure_ascii=False)[:1200]
+            details = data.get("details", {}) if isinstance(data, dict) else {}
 
-            # Try tests under 'details' key variations
-            tests_raw = []
-            # 1. Loose walk
-            find_tests_loose(data, tests_raw)
-
-            # Also try known keys directly
-            for key_path in ("details.tests", "tests", "testList", "test_list",
-                             "details.testList", "details.testsList", "details.test",
-                             "data.tests"):
-                parts = key_path.split(".")
-                node = data
-                ok = True
-                for p in parts:
-                    if isinstance(node, dict) and p in node:
-                        node = node[p]
+            # Dump structure of interesting keys
+            interesting_keys = ["sections", "branches", "stagesFullTests", "menus",
+                                "superSections", "examStages", "studyNotesGroup"]
+            for k in interesting_keys:
+                if k in details:
+                    v = details[k]
+                    if isinstance(v, list):
+                        debug["structure"][k] = f"list len={len(v)}"
+                        if v and isinstance(v[0], dict):
+                            debug["structure"][k + "_first_keys"] = list(v[0].keys())
+                    elif isinstance(v, dict):
+                        debug["structure"][k] = f"dict keys={list(v.keys())[:15]}"
                     else:
-                        ok = False
-                        break
-                if ok and isinstance(node, list):
-                    for x in node:
-                        if isinstance(x, dict):
-                            tests_raw.append(x)
+                        debug["structure"][k] = str(v)[:80]
 
-            # Normalize
-            tests = []
-            seen = set()
-            for t in tests_raw:
-                tid = str(t.get("id") or t.get("_id") or t.get("testId") or "")
-                if not tid or tid in seen:
-                    continue
-                seen.add(tid)
-                tests.append({
-                    "id": tid,
-                    "title": str(t.get("name") or t.get("title") or "Test"),
-                    "questionCount": (t.get("questionCount") or t.get("totalQuestions")
-                                      or t.get("questionsCount") or t.get("questions") or 0),
-                    "duration": t.get("duration") or t.get("totalTime") or t.get("time") or 0,
-                    "totalMarks": t.get("totalMarks") or t.get("marks") or t.get("maxMarks") or 0,
-                })
+            # Find all tests anywhere in the response
+            raw_tests: List[dict] = []
+            find_all_tests(details, raw_tests)
+
+            # Also explicitly dig into common paths
+            for path in ("tests", "testList", "test_list"):
+                if isinstance(details.get(path), list):
+                    raw_tests.extend([x for x in details[path] if isinstance(x, dict)])
+
+            # If tests are inside sections/branches/superSections, recursively find
+            for container_key in ("sections", "branches", "superSections", "menus",
+                                  "stagesFullTests", "examStages"):
+                container = details.get(container_key)
+                if container:
+                    find_all_tests(container, raw_tests)
+
+            tests = normalize_tests(raw_tests)
             debug["tests_found"] = len(tests)
 
-            # Series info
-            details = data.get("details", {}) if isinstance(data, dict) else {}
             series_info = {
                 "id": series_id,
                 "title": details.get("name") or "Test Series",
                 "description": details.get("description") or "",
+                "slug": details.get("slug") or "",
             }
-            return series_info, tests, debug
+            return tests, debug, series_info
     except Exception as e:
         debug["error"] = str(e)
-        return None, [], debug
+        return [], debug, None
 
-# ---------- HTML fallback ----------
-async def fetch_series_tests_html(token: str, series_id: str, slug: str) -> tuple[List[Dict], str]:
-    """Fetch series page HTML and extract test links."""
-    urls_to_try = []
-    if slug:
-        urls_to_try.append(f"{BASE_URL}/test-series/{slug}")
-    urls_to_try.append(f"{BASE_URL}/test-series/{series_id}")
-
-    for url in urls_to_try:
-        try:
-            async with httpx.AsyncClient(follow_redirects=True, timeout=25.0) as client:
-                r = await client.get(url, headers=tb_headers(token, json_accept=False))
-            if r.status_code != 200:
+# ---------- Try fetching tests via query ----------
+async def fetch_tests_by_query(token: str, series_id: str) -> tuple[List[Dict], str]:
+    """Some Testbook APIs return tests when filtered."""
+    candidates = [
+        f"{API_BASE}/api/v2_1/tests?testSeriesId={quote(series_id, safe='')}",
+        f"{API_BASE}/api/v2_1/tests?seriesId={quote(series_id, safe='')}",
+        f"{API_BASE}/api/v2/tests?testSeriesId={quote(series_id, safe='')}",
+        f"{API_BASE}/api/v2_1/test-series/{quote(series_id, safe='')}/tests?fetchAll=true",
+    ]
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        for url in candidates:
+            full = f"{url}{'&' if '?' in url else '?'}auth_code={quote(token, safe='')}&language=english"
+            try:
+                r = await client.get(full, headers=tb_headers(token))
+                if r.status_code != 200:
+                    continue
+                j = r.json()
+                if not j.get("success"):
+                    continue
+                raw: List[dict] = []
+                find_all_tests(j, raw)
+                tests = normalize_tests(raw)
+                if tests:
+                    return tests, url
+            except Exception:
                 continue
-            soup = BeautifulSoup(r.text, "html.parser")
-            tests, seen = [], set()
-            for a in soup.find_all("a", href=True):
-                href = a["href"]
-                text = a.get_text(" ", strip=True)
-                if not text or len(text) < 4:
-                    continue
-                # Accept various test URL patterns
-                if not any(x in href for x in ("/tests/", "/take-test/", "/attempt/", "/test/")):
-                    continue
-                absolute = href if href.startswith("http") else BASE_URL + href
-                if absolute in seen:
-                    continue
-                seen.add(absolute)
-                # Extract ID from URL
-                tid = absolute.rstrip("/").split("/")[-1]
-                tests.append({"id": tid, "title": text, "url": absolute,
-                              "questionCount": 0, "duration": 0, "totalMarks": 0})
-            if tests:
-                return tests, f"html:{url}"
-        except Exception as e:
-            print(f"html err {url}:", e)
     return [], "none"
 
 # ---------- Error handlers ----------
@@ -302,6 +297,7 @@ box-shadow:0 2px 10px rgba(0,0,0,.06);border-left:4px solid #4f46e5}
 font-weight:700;padding:3px 9px;border-radius:12px;margin-top:8px;
 text-transform:uppercase;letter-spacing:.3px}
 .badge.green{background:#d1fae5;color:#059669}
+.badge.orange{background:#fed7aa;color:#c2410c}
 .row{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px}
 .empty{text-align:center;padding:40px 20px;color:#a0aec0}
 .empty h2{font-size:18px;margin-bottom:8px;color:#4a5568}
@@ -375,7 +371,7 @@ __ERROR__
 
 # ---------- Routes ----------
 @app.get("/health")
-async def health(): return {"status":"ok","version":"12.0.0"}
+async def health(): return {"status":"ok","version":"13.0.0"}
 
 @app.get("/", response_class=HTMLResponse)
 async def root(error: Optional[str] = None,
@@ -456,24 +452,26 @@ async def series_page(id: str = Query(...), slug: str = Query(""),
     if not token:
         return RedirectResponse("/", status_code=302)
 
-    info, tests, dbg = await fetch_series_detail(token, id)
+    tests, dbg, info = await fetch_series_tests(token, id)
     title = (info or {}).get("title") or "Test Series"
 
-    # Fallback: HTML scrape
-    html_src = "none"
+    # Fallback: try query endpoint
+    fallback_source = ""
     if not tests:
-        tests, html_src = await fetch_series_tests_html(token, id, slug)
+        tests, fallback_source = await fetch_tests_by_query(token, id)
 
     debug_html = ""
     if debug == 1:
-        debug_html = f'<div class="debug">API: {json.dumps(dbg, indent=2, ensure_ascii=False)[:2500]}\n\nHTML src: {html_src}\n\nTESTS:\n{json.dumps(tests[:10], indent=2, ensure_ascii=False)}</div>'
+        debug_html = f'<div class="debug">STRUCTURE:\n{json.dumps(dbg.get("structure", {}), indent=2, ensure_ascii=False)}\n\nstatus: {dbg.get("status")}\ntests_found: {dbg.get("tests_found")}\nfallback: {fallback_source}\n\nTESTS:\n{json.dumps(tests[:15], indent=2, ensure_ascii=False)}</div>'
 
     if tests:
         cards = "".join(
             f'<div class="card"><a href="/test?id={quote(t["id"], safe="")}&name={quote(t["title"], safe="")}">'
             f'<h3>{t["title"]}</h3>'
             f'<p>{f"📝 {t[chr(113)+chr(117)+chr(101)+chr(115)+chr(116)+chr(105)+chr(111)+chr(110)+chr(67)+chr(111)+chr(117)+chr(110)+chr(116)]} Qs" if t.get("questionCount") else ""}'
-            f'{f" · ⏱ {t[chr(100)+chr(117)+chr(114)+chr(97)+chr(116)+chr(105)+chr(111)+chr(110)]} min" if t.get("duration") else ""}</p>'
+            f'{f" · ⏱ {t[chr(100)+chr(117)+chr(114)+chr(97)+chr(116)+chr(105)+chr(111)+chr(110)]} min" if t.get("duration") else ""}'
+            f'{f" · 🎯 {t[chr(116)+chr(111)+chr(116)+chr(97)+chr(108)+chr(77)+chr(97)+chr(114)+chr(107)+chr(115)]} marks" if t.get("totalMarks") else ""}</p>'
+            f'{"<span class=badge orange>LIVE</span>" if t.get("testType") and "live" in str(t.get("testType","")).lower() else ""}'
             f'<span class="badge green">Open Test →</span></a></div>'
             for t in tests
         )
@@ -503,23 +501,21 @@ async def test_page(id: str = Query(...), name: str = Query(""),
         return RedirectResponse("/", status_code=302)
 
     title = name or "Test"
-    testbook_test_url = f"{BASE_URL}/take-test/{id}"
-
     body = f"""<a href="javascript:history.back()" class="back-btn">← Back</a>
     <div class="info-box"><b>🎯 {title}</b></div>
     <div class="card">
       <h3>{title}</h3>
       <p>Test ID: <code>{id}</code></p>
-      <p>Live test dena Testbook ke app par hi possible hai (kyunki exam real-time hota hai).</p>
+      <p>Live test Testbook par hi dena hoga (real-time exam).</p>
     </div>
     <div style="text-align:center;margin-top:24px;">
-      <a href="{testbook_test_url}" target="_blank" class="btn green" style="padding:14px 28px;font-size:15px;">
+      <a href="{BASE_URL}/take-test/{id}" target="_blank" class="btn green" style="padding:14px 28px;font-size:15px;">
         🎯 Start Test on Testbook
       </a>
     </div>"""
     return HTMLResponse(shell(title, body))
 
-# ---------- Debug probe ----------
+# ---------- Deep debug ----------
 @app.get("/debug/probe", response_class=HTMLResponse)
 async def probe(session_cookie: Optional[str] = Cookie(None, alias="tb_session")):
     token = get_token(session_cookie)
@@ -527,44 +523,49 @@ async def probe(session_cookie: Optional[str] = Cookie(None, alias="tb_session")
         return RedirectResponse("/", status_code=302)
 
     lines = []
-    # Fetch series list to get a sample ID
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
+        async with httpx.AsyncClient(timeout=20.0) as client:
             r = await client.get(f"{SERIES_LIST_API}?exam=rrb-group-d&auth_code={quote(token,safe='')}", headers=tb_headers(token))
             j = r.json()
             ts = j.get("data",{}).get("testSeries",[])
             if ts:
                 sample = ts[0]["details"]
                 sid = sample["id"]
-                sslug = sample.get("slug", "")
-                lines.append(f"Sample series: {sample['name']}")
+                lines.append(f"Testing: {sample['name']}")
                 lines.append(f"ID: {sid}")
-                lines.append(f"Slug: {sslug}")
                 lines.append("")
 
-                # Fetch full series detail
                 r2 = await client.get(f"{API_BASE}/api/v2_1/test-series/{sid}?auth_code={quote(token,safe='')}", headers=tb_headers(token))
-                j2 = r2.json()
-                data = j2.get("data", {})
-                lines.append(f"=== DETAIL DATA (keys: {list(data.keys())}) ===")
-                # Dump each top-level key briefly
-                for k, v in data.items():
-                    if isinstance(v, dict):
-                        lines.append(f"\n[{k}] dict keys: {list(v.keys())}")
-                    elif isinstance(v, list):
-                        lines.append(f"\n[{k}] list len: {len(v)}")
-                        if v and isinstance(v[0], dict):
-                            lines.append(f"    first item keys: {list(v[0].keys())}")
+                data = r2.json().get("data", {})
+                details = data.get("details", {})
+
+                # Examine each potentially-test-containing key
+                for key in ["sections", "branches", "superSections", "menus",
+                            "stagesFullTests", "examStages", "studyNotesGroup",
+                            "testSeriesCategory", "faqDetails", "features"]:
+                    if key not in details:
+                        continue
+                    v = details[key]
+                    lines.append(f"\n=== [{key}] type={type(v).__name__} ===")
+                    if isinstance(v, list):
+                        lines.append(f"   len={len(v)}")
+                        if v:
+                            lines.append(f"   first item type={type(v[0]).__name__}")
+                            if isinstance(v[0], dict):
+                                lines.append(f"   first item keys={list(v[0].keys())}")
+                                lines.append(f"   first item sample={json.dumps(v[0], ensure_ascii=False)[:500]}")
+                            elif isinstance(v[0], (str, int)):
+                                lines.append(f"   sample items: {v[:5]}")
+                    elif isinstance(v, dict):
+                        lines.append(f"   keys={list(v.keys())[:20]}")
+                        lines.append(f"   sample={json.dumps(v, ensure_ascii=False)[:400]}")
                     else:
-                        lines.append(f"\n[{k}] = {str(v)[:100]}")
-                lines.append("")
-                lines.append("=== FULL JSON (first 2500 chars) ===")
-                lines.append(json.dumps(data, ensure_ascii=False)[:2500])
+                        lines.append(f"   value={str(v)[:200]}")
     except Exception as e:
         lines.append(f"ERR: {e}")
 
     body = f"""<a href="/dashboard" class="back-btn">← Back</a>
-    <div class="info-box">Full series detail ka structure</div>
+    <div class="info-box">Har key ka structure</div>
     <div class="debug">{chr(10).join(lines)}</div>"""
     return HTMLResponse(shell("Debug", body))
 

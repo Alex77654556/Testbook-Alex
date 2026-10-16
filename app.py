@@ -13,7 +13,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from typing import Optional, List, Dict, Any
 from urllib.parse import quote
 
-app = FastAPI(title="Testbook Mirror", version="23.0.0")
+app = FastAPI(title="Testbook Mirror", version="24.0.0")
 
 BASE_URL = "https://testbook.com"
 API_BASE = "https://api.testbook.com"
@@ -48,8 +48,7 @@ def get_token(session_cookie: Optional[str]) -> Optional[str]:
 def decode_jwt_payload(token: str) -> Optional[dict]:
     try:
         parts = token.split(".")
-        if len(parts) != 3:
-            return None
+        if len(parts) != 3: return None
         payload = parts[1] + "=" * (-len(parts[1]) % 4)
         return json.loads(base64.urlsafe_b64decode(payload))
     except Exception:
@@ -57,8 +56,7 @@ def decode_jwt_payload(token: str) -> Optional[dict]:
 
 def validate_jwt(token: str):
     p = decode_jwt_payload(token)
-    if p is None:
-        return False, "Token JWT format me nahi hai"
+    if p is None: return False, "Token JWT format me nahi hai"
     exp = p.get("exp")
     if exp and isinstance(exp, (int, float)) and exp < time.time():
         return False, "Token expire ho gaya hai"
@@ -68,11 +66,8 @@ def validate_jwt(token: str):
 
 def get_user_info(token: str) -> dict:
     p = decode_jwt_payload(token) or {}
-    return {
-        "name": p.get("name") or "User",
-        "email": p.get("email") or "",
-        "isPaid": p.get("isPaidUser", False),
-    }
+    return {"name": p.get("name") or "User", "email": p.get("email") or "",
+            "isPaid": p.get("isPaidUser", False), "sub": p.get("sub") or ""}
 
 def tb_headers(token: str, json_accept: bool = True) -> Dict[str, str]:
     return {
@@ -94,8 +89,7 @@ async def fetch_stats(token: str) -> Optional[dict]:
             r = await client.get(url, headers=tb_headers(token))
             if r.status_code == 200:
                 j = r.json()
-                if j.get("success"):
-                    return j.get("data", {})
+                if j.get("success"): return j.get("data", {})
     except Exception as e:
         print("stats error:", e)
     return None
@@ -106,24 +100,18 @@ async def fetch_series_list(token: str) -> List[Dict]:
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
             r = await client.get(url, headers=tb_headers(token))
-            if r.status_code != 200:
-                return []
+            if r.status_code != 200: return []
             j = r.json()
-            if not j.get("success"):
-                return []
+            if not j.get("success"): return []
             ts = j.get("data", {}).get("testSeries", [])
             results = []
             for item in ts:
                 d = item.get("details", {}) if isinstance(item, dict) else {}
                 sid = str(d.get("id") or "")
-                if not sid:
-                    continue
-                results.append({
-                    "id": sid,
-                    "slug": str(d.get("slug") or ""),
-                    "title": str(d.get("name") or "Test Series"),
-                    "description": str(d.get("description") or "")[:200],
-                })
+                if not sid: continue
+                results.append({"id": sid, "slug": str(d.get("slug") or ""),
+                                "title": str(d.get("name") or "Test Series"),
+                                "description": str(d.get("description") or "")[:200]})
             return results
     except Exception as e:
         print("series list error:", e)
@@ -184,42 +172,40 @@ def normalize_tests(raw: List[dict]) -> List[Dict]:
         })
     return result
 
-# ---------- ⚡ MEGA URL LIST with tsid + all variations ----------
-def build_mega_urls(series_id: str, section_id: str, subsection_id: str, slug: str) -> List[Dict]:
+# ---------- HYPOTHESIS: Load ALL tests for series at once ----------
+def build_series_test_urls(series_id: str, slug: str) -> List[Dict]:
+    """Try loading all tests for the whole series (frontend filters client-side)."""
     s = quote(series_id, safe="")
-    sec = quote(section_id, safe="")
-    sub = quote(subsection_id, safe="")
-    qs = f"tsid={s}&sectionId={sec}&subsectionId={sub}"
-    qs2 = f"tsid={s}&sid={sec}&ssid={sub}"
-    qs3 = f"testSeriesId={s}&sectionId={sec}&subsectionId={sub}"
-    qs4 = f"tsId={s}&sectionId={sec}&subsectionId={sub}"
-    base_paths = [f"{API_BASE}/api/v2_1/live-panel", f"{API_BASE}/api/v2_1", f"{API_BASE}/api/v2", f"{API_BASE}/api/v3"]
+    sl = quote(slug, safe="")
     urls = []
-    # Query param styles
-    for base in base_paths:
-        for q in (qs, qs2, qs3, qs4):
-            urls.append({"m": "GET", "u": f"{base}/tests?{q}"})
-            urls.append({"m": "GET", "u": f"{base}/test-list?{q}"})
-            urls.append({"m": "GET", "u": f"{base}/testList?{q}"})
-            urls.append({"m": "GET", "u": f"{base}/test-series-tests?{q}"})
-    # tsid alone
-    for base in base_paths:
-        urls.append({"m": "GET", "u": f"{base}/tests?tsid={s}"})
-        urls.append({"m": "GET", "u": f"{base}/test-list?tsid={s}"})
-    # Path style
-    for base in base_paths:
-        urls.append({"m": "GET", "u": f"{base}/test-series/{s}/sections/{sec}/subsections/{sub}/tests"})
-        urls.append({"m": "GET", "u": f"{base}/subsections/{sub}/tests"})
-        urls.append({"m": "GET", "u": f"{base}/subsections/{sub}/test-list"})
-        urls.append({"m": "GET", "u": f"{base}/sections/{sec}/tests"})
-    # POST with JSON
-    for base in base_paths:
-        urls.append({"m": "POST", "u": f"{base}/tests", "b": {"tsid": series_id, "sectionId": section_id, "subsectionId": subsection_id}})
-        urls.append({"m": "POST", "u": f"{base}/tests/list", "b": {"tsid": series_id, "sectionId": section_id, "subsectionId": subsection_id}})
-        urls.append({"m": "POST", "u": f"{base}/test-list", "b": {"tsid": series_id, "sectionId": section_id, "subsectionId": subsection_id}})
+    # All possible param names for series
+    for param in ("tsid", "tsId", "testSeriesId", "seriesId", "test-series-id"):
+        urls.append({"m": "GET", "u": f"{API_BASE}/api/v2_1/tests?{param}={s}"})
+        urls.append({"m": "GET", "u": f"{API_BASE}/api/v2_1/live-panel/tests?{param}={s}"})
+        urls.append({"m": "GET", "u": f"{API_BASE}/api/v2_1/test-list?{param}={s}"})
+        urls.append({"m": "GET", "u": f"{API_BASE}/api/v2/tests?{param}={s}"})
+        urls.append({"m": "GET", "u": f"{API_BASE}/api/v2/test-list?{param}={s}"})
+    # Path-based
+    for base in (f"{API_BASE}/api/v2_1", f"{API_BASE}/api/v2_1/live-panel", f"{API_BASE}/api/v2"):
+        urls.append({"m": "GET", "u": f"{base}/test-series/{s}/tests"})
+        urls.append({"m": "GET", "u": f"{base}/test-series/{s}/test-list"})
+        urls.append({"m": "GET", "u": f"{base}/test-series/{s}/all-tests"})
+        urls.append({"m": "GET", "u": f"{base}/series/{s}/tests"})
+    # Slug based
+    if slug:
+        urls.append({"m": "GET", "u": f"{API_BASE}/api/v2_1/tests?slug={sl}"})
+        urls.append({"m": "GET", "u": f"{API_BASE}/api/v2_1/tests?tsSlug={sl}"})
+        urls.append({"m": "GET", "u": f"{API_BASE}/api/v2_1/test-series/{sl}/tests"})
+    # POST variants (since endpoint exists)
+    urls.append({"m": "POST", "u": f"{API_BASE}/api/v2_1/tests", "b": {"tsid": series_id}})
+    urls.append({"m": "POST", "u": f"{API_BASE}/api/v2_1/tests", "b": {"tsid": series_id, "page": 1, "limit": 500}})
+    urls.append({"m": "POST", "u": f"{API_BASE}/api/v2_1/tests", "b": {"testSeriesId": series_id}})
+    urls.append({"m": "POST", "u": f"{API_BASE}/api/v2_1/tests", "b": {"tsid": series_id, "language": "english"}})
+    # Also try without any param (baseline)
+    urls.append({"m": "GET", "u": f"{API_BASE}/api/v2_1/tests"})
     return urls
 
-async def probe_one(client: httpx.AsyncClient, token: str, entry: Dict) -> tuple[Dict, int, List[Dict]]:
+async def probe_one(client: httpx.AsyncClient, token: str, entry: Dict) -> tuple[Dict, int, int, List[Dict]]:
     method = entry["m"]
     url = entry["u"]
     try:
@@ -229,53 +215,39 @@ async def probe_one(client: httpx.AsyncClient, token: str, entry: Dict) -> tuple
         else:
             full = f"{url}?auth_code={quote(token, safe='')}&language=english"
             r = await client.request("POST", full, headers=tb_headers(token), json=entry.get("b"))
-        if r.status_code != 200: return entry, r.status_code, []
+        if r.status_code != 200:
+            return entry, r.status_code, 0, []
         try: j = r.json()
-        except: return entry, r.status_code, []
-        if not isinstance(j, dict): return entry, r.status_code, []
+        except: return entry, r.status_code, 0, []
+        if not isinstance(j, dict): return entry, r.status_code, 0, []
         raw: List[dict] = []
         find_tests_loose(j, raw)
-        # Also check `success` flag OR presence of tests
-        if not j.get("success") and not raw: return entry, r.status_code, []
-        return entry, r.status_code, normalize_tests(raw)
+        return entry, r.status_code, len(raw), normalize_tests(raw)
     except Exception:
-        return entry, 0, []
+        return entry, 0, 0, []
 
-async def probe_subsection_full(token: str, series_id: str, sec_id: str, sub_id: str, slug: str) -> tuple[List[Dict], str, int]:
-    entries = build_mega_urls(series_id, sec_id, sub_id, slug)
-    async with httpx.AsyncClient(follow_redirects=True, timeout=5.0) as client:
-        tasks = [probe_one(client, token, e) for e in entries]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        for res in results:
-            if isinstance(res, Exception): continue
-            entry, status, tests = res
-            if tests:
-                return tests, f"{entry['m']}:{entry['u']}", status
-    return [], "none", 0
-
-# ---------- Main fetch ----------
-async def fetch_series_tests(token: str, series_id: str) -> tuple[List[Dict], Dict, Optional[Dict]]:
-    debug = {"mode": "unknown", "status": 0, "inline_count": 0, "probe_count": 0,
-             "subs_with_tests": 0, "probe_results": []}
+# ---------- Main fetch: All-tests approach ----------
+async def fetch_series_tests(token: str, series_id: str, slug: str = "") -> tuple[List[Dict], Dict, Optional[Dict]]:
+    debug = {"mode": "unknown", "status": 0, "inline_count": 0,
+             "series_level_probe": [], "tests_found": 0}
     url = f"{API_BASE}/api/v2_1/test-series/{quote(series_id, safe='')}?auth_code={quote(token, safe='')}&language=english"
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
             r = await client.get(url, headers=tb_headers(token))
             debug["status"] = r.status_code
-            if r.status_code != 200:
-                return [], debug, None
+            if r.status_code != 200: return [], debug, None
             j = r.json()
-            if not j.get("success"):
-                return [], debug, None
+            if not j.get("success"): return [], debug, None
             data = j.get("data", {})
             details = data.get("details", {})
             series_info = {
                 "id": series_id,
                 "title": details.get("name") or "Test Series",
                 "description": details.get("description") or "",
-                "slug": details.get("slug") or "",
+                "slug": details.get("slug") or slug,
             }
-            slug = series_info["slug"]
+            if not slug:
+                slug = series_info["slug"]
 
             # Inline check
             raw_inline: List[dict] = []
@@ -287,80 +259,27 @@ async def fetch_series_tests(token: str, series_id: str) -> tuple[List[Dict], Di
                 debug["tests_found"] = len(inline_tests)
                 return inline_tests, debug, series_info
 
-            # Build subsection list
-            sections = details.get("sections", [])
-            pairs = []
-            for sec in sections:
-                for sub in sec.get("subsections", []):
-                    free = sub.get("freeTestCount") or 0
-                    paid = sub.get("paidTestCount") or 0
-                    if free + paid > 0:
-                        pairs.append({"sec_id": sec.get("id", ""), "sub_id": sub.get("id", ""),
-                                      "sec_name": sec.get("name", ""), "sub_name": sub.get("name", ""),
-                                      "total": free + paid})
-            debug["subs_with_tests"] = len(pairs)
-            if not pairs:
-                debug["mode"] = "no-subs-with-tests"
-                return [], debug, series_info
+            # ⚡ HYPOTHESIS: Load all tests for series at once
+            debug["mode"] = "series-level-hypothesis"
+            urls = build_series_test_urls(series_id, slug)
 
-            pairs.sort(key=lambda x: x["total"], reverse=True)
-            debug["mode"] = "mega-probe"
+            async with httpx.AsyncClient(follow_redirects=True, timeout=6.0) as c:
+                tasks = [probe_one(c, token, e) for e in urls]
+                results = await asyncio.gather(*tasks, return_exceptions=True)
 
-            # Probe top 3 subs first (find winner pattern)
-            async def probe_pair(p):
-                tests, winner, status = await probe_subsection_full(token, series_id, p["sec_id"], p["sub_id"], slug)
-                return {**p, "tests": tests, "winner": winner, "status": status}
-
-            top3 = pairs[:3]
-            tasks = [probe_pair(p) for p in top3]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-
-            winner_url = None
-            all_tests = []
             for res in results:
                 if isinstance(res, Exception): continue
-                debug["probe_results"].append({
-                    "name": f"{res['sec_name']} / {res['sub_name']}",
-                    "count": len(res["tests"]),
-                    "winner": res["winner"][:100],
-                    "status": res["status"],
+                entry, status, raw_count, tests = res
+                debug["series_level_probe"].append({
+                    "url": entry["u"], "method": entry["m"],
+                    "status": status, "raw": raw_count
                 })
-                if res["tests"]:
-                    all_tests.extend(res["tests"])
-                    if not winner_url:
-                        winner_url = res["winner"]
+                if tests:
+                    debug["mode"] = f"series-level:{entry['m']}:{entry['u']}"
+                    debug["tests_found"] = len(tests)
+                    return tests, debug, series_info
 
-            debug["winner"] = winner_url
-            debug["probe_count"] = len(all_tests)
-
-            if not winner_url:
-                debug["tests_found"] = 0
-                return [], debug, series_info
-
-            # If winner found, probe remaining (in batches)
-            remaining = pairs[3:20]  # limit to 17 more
-            async def probe_more(p):
-                tests, _, _ = await probe_subsection_full(token, series_id, p["sec_id"], p["sub_id"], slug)
-                return tests
-
-            if remaining:
-                BATCH = 8
-                for i in range(0, len(remaining), BATCH):
-                    batch = remaining[i:i+BATCH]
-                    tasks = [probe_more(p) for p in batch]
-                    results = await asyncio.gather(*tasks, return_exceptions=True)
-                    for res in results:
-                        if isinstance(res, list): all_tests.extend(res)
-
-            # Deduplicate
-            seen = set()
-            final = []
-            for t in all_tests:
-                if t["id"] not in seen:
-                    seen.add(t["id"])
-                    final.append(t)
-            debug["tests_found"] = len(final)
-            return final, debug, series_info
+            return [], debug, series_info
     except Exception as e:
         debug["error"] = str(e)
         return [], debug, None
@@ -473,13 +392,12 @@ __ERROR__
 
 # ---------- Routes ----------
 @app.get("/health")
-async def health(): return {"status":"ok","version":"23.0.0"}
+async def health(): return {"status":"ok","version":"24.0.0"}
 
 @app.get("/", response_class=HTMLResponse)
 async def root(error: Optional[str] = None,
                session_cookie: Optional[str] = Cookie(None, alias="tb_session")):
-    if get_token(session_cookie):
-        return RedirectResponse("/dashboard", status_code=302)
+    if get_token(session_cookie): return RedirectResponse("/dashboard", status_code=302)
     err = '<div class="error">Token expire ho gaya. Dobara login karein.</div>' if error == "session" else ""
     return HTMLResponse(LOGIN_HTML.replace("__ERROR__", err))
 
@@ -488,10 +406,8 @@ async def login(token: str = Form(...)):
     token = token.strip()
     if not token:
         return HTMLResponse(LOGIN_HTML.replace("__ERROR__",'<div class="error">Token khali hai.</div>'), status_code=400)
-    if token.lower().startswith("bearer "):
-        token = token[7:].strip()
-    if "auth_code=" in token:
-        token = token.split("auth_code=")[1].split("&")[0]
+    if token.lower().startswith("bearer "): token = token[7:].strip()
+    if "auth_code=" in token: token = token.split("auth_code=")[1].split("&")[0]
     ok, msg = validate_jwt(token)
     if not ok:
         return HTMLResponse(LOGIN_HTML.replace("__ERROR__", f'<div class="error">❌ {msg}</div>'), status_code=401)
@@ -511,8 +427,7 @@ async def logout():
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard(session_cookie: Optional[str] = Cookie(None, alias="tb_session")):
     token = get_token(session_cookie)
-    if not token:
-        return RedirectResponse("/", status_code=302)
+    if not token: return RedirectResponse("/", status_code=302)
     user = get_user_info(token)
     stats = await fetch_stats(token)
     series = await fetch_series_list(token)
@@ -529,7 +444,7 @@ async def dashboard(session_cookie: Optional[str] = Cookie(None, alias="tb_sessi
 
     if series:
         cards = "".join(
-            f'<div class="card"><a href="/series?id={quote(item["id"], safe="")}">'
+            f'<div class="card"><a href="/series?id={quote(item["id"], safe="")}&slug={quote(item.get("slug","") or "", safe="")}">'
             f'<h3>{item["title"]}</h3>'
             f'{f"<p>{item[chr(100)+chr(101)+chr(115)+chr(99)+chr(114)+chr(105)+chr(112)+chr(116)+chr(105)+chr(111)+chr(110)][:140]}...</p>" if item.get("description") else ""}'
             f'<span class="badge">Open Series →</span></a></div>'
@@ -546,11 +461,10 @@ async def dashboard(session_cookie: Optional[str] = Cookie(None, alias="tb_sessi
 
 # ---------- Series Page ----------
 @app.get("/series", response_class=HTMLResponse)
-async def series_page(id: str = Query(...),
+async def series_page(id: str = Query(...), slug: str = Query(""),
                       session_cookie: Optional[str] = Cookie(None, alias="tb_session")):
     token = get_token(session_cookie)
-    if not token:
-        return RedirectResponse("/", status_code=302)
+    if not token: return RedirectResponse("/", status_code=302)
     title = "Test Series"
     try:
         url = f"{API_BASE}/api/v2_1/test-series/{quote(id, safe='')}?auth_code={quote(token, safe='')}&language=english"
@@ -560,18 +474,17 @@ async def series_page(id: str = Query(...),
                 j = r.json()
                 if j.get("success"):
                     title = j.get("data", {}).get("details", {}).get("name") or title
-    except Exception:
-        pass
+    except Exception: pass
 
     body = f"""<a href="/dashboard" class="back-btn">← Back</a>
     <div class="info-box"><b>📚 {title}</b></div>
     <div id="loading" class="loading-box">
       <div class="spinner"></div>
-      <p>Tests load ho rahe hain (30-40 sec)...</p>
+      <p>Tests load ho rahe hain...</p>
     </div>
     <div id="results"></div>
     <script>
-      fetch('/api/series-tests?id={quote(id, safe="")}')
+      fetch('/api/series-tests?id={quote(id, safe="")}&slug={quote(slug, safe="")}')
         .then(r => r.json())
         .then(data => {{
           document.getElementById('loading').style.display = 'none';
@@ -607,22 +520,17 @@ async def series_page(id: str = Query(...),
 
 # ---------- API: series tests ----------
 @app.get("/api/series-tests")
-async def api_series_tests(id: str = Query(...),
+async def api_series_tests(id: str = Query(...), slug: str = Query(""),
                            session_cookie: Optional[str] = Cookie(None, alias="tb_session")):
     token = get_token(session_cookie)
-    if not token:
-        return JSONResponse({"error": "not logged in", "tests": []}, status_code=401)
+    if not token: return JSONResponse({"error": "not logged in", "tests": []}, status_code=401)
     try:
-        tests, debug, info = await asyncio.wait_for(fetch_series_tests(token, id), timeout=55.0)
-        return {
-            "tests": tests,
-            "count": len(tests),
-            "mode": debug.get("mode"),
-            "inline_count": debug.get("inline_count", 0),
-            "error": debug.get("error"),
-        }
+        tests, debug, info = await asyncio.wait_for(fetch_series_tests(token, id, slug), timeout=40.0)
+        return {"tests": tests, "count": len(tests),
+                "mode": debug.get("mode"), "inline_count": debug.get("inline_count", 0),
+                "error": debug.get("error")}
     except asyncio.TimeoutError:
-        return {"tests": [], "error": "Timeout 55s"}
+        return {"tests": [], "error": "Timeout 40s"}
     except Exception as e:
         return {"tests": [], "error": str(e)}
 
@@ -631,8 +539,7 @@ async def api_series_tests(id: str = Query(...),
 async def test_page(id: str = Query(...), name: str = Query(""),
                     session_cookie: Optional[str] = Cookie(None, alias="tb_session")):
     token = get_token(session_cookie)
-    if not token:
-        return RedirectResponse("/", status_code=302)
+    if not token: return RedirectResponse("/", status_code=302)
     title = name or "Test"
     body = f"""<a href="javascript:history.back()" class="back-btn">← Back</a>
     <div class="info-box"><b>🎯 {title}</b></div>
@@ -644,12 +551,11 @@ async def test_page(id: str = Query(...), name: str = Query(""),
     </div>"""
     return HTMLResponse(shell(title, body))
 
-# ---------- Debug probe: mega URL list on one subsection ----------
+# ---------- Debug probe: ALL-series-tests hypothesis ----------
 @app.get("/debug/probe", response_class=HTMLResponse)
 async def probe(session_cookie: Optional[str] = Cookie(None, alias="tb_session")):
     token = get_token(session_cookie)
-    if not token:
-        return RedirectResponse("/", status_code=302)
+    if not token: return RedirectResponse("/", status_code=302)
 
     user = get_user_info(token)
     lines = []
@@ -668,56 +574,39 @@ async def probe(session_cookie: Optional[str] = Cookie(None, alias="tb_session")
                 slug = ts[0]["details"].get("slug", "")
                 lines.append(f"Series: {ts[0]['details']['name']}")
                 lines.append(f"ID: {sid} | Slug: {slug}")
+                lines.append("")
 
-                r2 = await client.get(f"{API_BASE}/api/v2_1/test-series/{sid}?auth_code={quote(token,safe='')}", headers=tb_headers(token))
-                data = r2.json().get("data", {})
-                details = data.get("details", {})
-                sections = details.get("sections", [])
+                # ⚡ HYPOTHESIS: load ALL tests for series at once
+                urls = build_series_test_urls(sid, slug)
+                lines.append(f"=== HYPOTHESIS: Load ALL tests for series ===")
+                lines.append(f"Trying {len(urls)} URL patterns (with tsid + POST)\n")
 
-                # Pick a subsection with tests (General Awareness: 104 paid)
-                target_sec = target_sub = None
-                for sec in sections:
-                    for sub in sec.get("subsections", []):
-                        if (sub.get("paidTestCount") or 0) + (sub.get("freeTestCount") or 0) > 50:
-                            target_sec = sec
-                            target_sub = sub
-                            break
-                    if target_sec: break
+                async with httpx.AsyncClient(follow_redirects=True, timeout=6.0) as c:
+                    tasks = [probe_one(c, token, e) for e in urls]
+                    results = await asyncio.gather(*tasks, return_exceptions=True)
 
-                if target_sec and target_sub:
-                    sec_id = target_sec["id"]
-                    sub_id = target_sub["id"]
-                    lines.append(f"\nTesting: {target_sec['name']} / {target_sub['name']}")
-                    lines.append(f"sectionId: {sec_id}")
-                    lines.append(f"subsectionId: {sub_id}")
-                    lines.append(f"Free: {target_sub.get('freeTestCount')} | Paid: {target_sub.get('paidTestCount')}")
-
-                    urls = build_mega_urls(sid, sec_id, sub_id, slug)
-                    lines.append(f"\n=== PROBING {len(urls)} URL PATTERNS IN PARALLEL ===\n")
-
-                    async with httpx.AsyncClient(follow_redirects=True, timeout=6.0) as c:
-                        tasks = [probe_one(c, token, e) for e in urls]
-                        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-                    for res in results:
-                        if isinstance(res, Exception):
-                            lines.append(f"💥 {res}")
-                            continue
-                        entry, status, tests = res
-                        method = entry["m"]
-                        u = entry["u"]
+                interesting = []
+                for res in results:
+                    if isinstance(res, Exception): continue
+                    entry, status, raw, tests = res
+                    if tests or (status == 200 and raw > 0):
+                        lines.append(f"✅ [{status}] ({entry['m']}) raw={raw} tests={len(tests)}")
+                        lines.append(f"   {entry['u']}")
                         if tests:
-                            lines.append(f"✅ [{status}] ({method}) count={len(tests)}")
-                            lines.append(f"    {u}")
-                            lines.append(f"    First: {json.dumps(tests[0], ensure_ascii=False)[:250]}")
-                        elif status == 200:
-                            lines.append(f"⚠️  [{status}] ({method}) 200-but-no-tests  {u[:110]}")
-                        elif status != 404 and status != 0:
-                            lines.append(f"❌ [{status}] ({method})  {u[:110]}")
+                            lines.append(f"   First: {json.dumps(tests[0], ensure_ascii=False)[:250]}")
+                        interesting.append(entry)
+                    elif status == 200:
+                        lines.append(f"⚠️  [200] ({entry['m']}) 200-but-empty  {entry['u'][:100]}")
+                    elif status == 405:
+                        lines.append(f"🔵 [405] ({entry['m']}) METHOD-NOT-ALLOWED  {entry['u'][:100]}")
+                    elif status == 400:
+                        lines.append(f"🟡 [400] ({entry['m']}) BAD-REQUEST  {entry['u'][:100]}")
+
+                lines.append(f"\n✅ Working: {len(interesting)}")
     except Exception as e:
         lines.append(f"ERR: {e}")
 
     body = f"""<a href="/dashboard" class="back-btn">← Back</a>
-    <div class="info-box">⚡ MEGA probe — {len(build_mega_urls('x','y','z',''))} URL patterns with <b>tsid</b> param</div>
+    <div class="info-box">⚡ NEW HYPOTHESIS: Load ALL tests for series at once</div>
     <div class="debug">{chr(10).join(lines)}</div>"""
     return HTMLResponse(shell("Debug", body))

@@ -28,12 +28,6 @@ def unsign(c: str) -> Optional[str]:
 
 def get_token(c): return unsign(c) if c else None
 
-def jwt_payload(tok):
-    try:
-        p = tok.split(".")[1]
-        return json.loads(base64.urlsafe_b64decode(p + "=" * (-len(p) % 4)))
-    except: return {}
-
 def tb_headers(token: str, html: bool = False) -> dict:
     return {
         "Authorization": f"Bearer {token}",
@@ -43,20 +37,22 @@ def tb_headers(token: str, html: bool = False) -> dict:
         "Accept-Encoding": "identity",
         "Referer": BASE_URL + "/",
         "Origin": BASE_URL,
-        "X-Client": "web,1.4",
-        "x-platform": "web",
         "Cookie": f"tb_token={token}",
     }
 
-# ---------- JS interceptor (injected into every HTML) ----------
+# ---------- JS interceptor (injected FIRST in <head>) ----------
 INTERCEPTOR = r"""
 (function(){
   if (window.__TB_PROXY_INSTALLED) return;
   window.__TB_PROXY_INSTALLED = true;
-  var TB = 'https://testbook.com', API = 'https://api.testbook.com';
-  var PP = '/tb', AP = '/tb-api';
+
+  var TB = 'https://testbook.com';
+  var API = 'https://api.testbook.com';
+  var PP = '/tb';
+  var AP = '/tb-api';
+
   function rw(u){
-    if (typeof u !== 'string') return u;
+    if (typeof u !== 'string' || !u) return u;
     if (u.indexOf(AP) === 0 || u.indexOf(PP + '/') === 0) return u;
     if (u.indexOf(API) === 0) return AP + u.slice(API.length);
     if (u.indexOf(TB) === 0) return PP + u.slice(TB.length);
@@ -65,28 +61,89 @@ INTERCEPTOR = r"""
     if (u.charAt(0) === '/' && u.charAt(1) !== '/') return PP + u;
     return u;
   }
-  var _f = window.fetch;
-  if (_f) window.fetch = function(inp, init){
-    try {
-      var u = typeof inp === 'string' ? inp : (inp && inp.url);
-      var nu = rw(u);
-      if (nu !== u) {
-        if (typeof inp === 'string') inp = nu;
-        else inp = new Request(nu, inp);
+  window.__tbRw = rw;
+
+  // === 1. Remove meta refresh ===
+  try {
+    document.querySelectorAll('meta[http-equiv="refresh" i]').forEach(function(m){ m.remove(); });
+  } catch(e){}
+
+  // === 2. Ensure base href ===
+  try {
+    var b = document.querySelector('base');
+    if (!b) {
+      b = document.createElement('base');
+      document.head.insertBefore(b, document.head.firstChild);
+    }
+    b.setAttribute('href', '/tb/');
+  } catch(e){}
+
+  // === 3. Patch window.location via Proxy (the delete trick) ===
+  try {
+    var realLoc = window.location;
+    delete window.location;
+    window.location = new Proxy(realLoc, {
+      get: function(t, p){
+        if (p === 'assign') return function(u){ return realLoc.assign(rw(u)); };
+        if (p === 'replace') return function(u){ return realLoc.replace(rw(u)); };
+        if (p === 'href') return realLoc.href;
+        var v = realLoc[p];
+        return typeof v === 'function' ? v.bind(realLoc) : v;
+      },
+      set: function(t, p, v){
+        if (p === 'href') { realLoc.href = rw(v); return true; }
+        realLoc[p] = v; return true;
       }
-    } catch(e){}
-    init = init || {};
-    init.credentials = 'same-origin';
-    return _f.call(this, inp, init);
-  };
-  var _o = XMLHttpRequest.prototype.open;
-  XMLHttpRequest.prototype.open = function(m, u){
-    arguments[1] = rw(u);
-    return _o.apply(this, arguments);
-  };
-  var _push = history.pushState, _rep = history.replaceState;
-  history.pushState = function(s, t, u){ return _push.call(this, s, t, u ? rw(u) : u); };
-  history.replaceState = function(s, t, u){ return _rep.call(this, s, t, u ? rw(u) : u); };
+    });
+  } catch(e){
+    // fallback if delete fails
+    try {
+      var _a = location.assign; location.assign = function(u){ return _a.call(location, rw(u)); };
+      var _r = location.replace; location.replace = function(u){ return _r.call(location, rw(u)); };
+    } catch(e2){}
+  }
+
+  // === 4. Patch history ===
+  try {
+    var _push = history.pushState, _rep = history.replaceState;
+    history.pushState = function(s, t, u){ return _push.call(this, s, t, u ? rw(u) : u); };
+    history.replaceState = function(s, t, u){ return _rep.call(this, s, t, u ? rw(u) : u); };
+  } catch(e){}
+
+  // === 5. Patch fetch ===
+  try {
+    var _f = window.fetch;
+    if (_f) window.fetch = function(inp, init){
+      try {
+        var u = typeof inp === 'string' ? inp : (inp && inp.url);
+        var nu = rw(u);
+        if (nu !== u) {
+          if (typeof inp === 'string') inp = nu;
+          else inp = new Request(nu, inp);
+        }
+      } catch(e){}
+      init = init || {};
+      init.credentials = 'same-origin';
+      return _f.call(this, inp, init);
+    };
+  } catch(e){}
+
+  // === 6. Patch XHR ===
+  try {
+    var _o = XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open = function(m, u){
+      arguments[1] = rw(u);
+      return _o.apply(this, arguments);
+    };
+  } catch(e){}
+
+  // === 7. Patch window.open ===
+  try {
+    var _open = window.open;
+    window.open = function(u, n, f){ return _open.call(this, rw(u), n, f); };
+  } catch(e){}
+
+  // === 8. Patch anchor.href setter ===
   try {
     var d = Object.getOwnPropertyDescriptor(HTMLAnchorElement.prototype, 'href');
     if (d && d.set) {
@@ -96,26 +153,55 @@ INTERCEPTOR = r"""
       });
     }
   } catch(e){}
+
+  // === 9. Intercept clicks on <a> ===
   document.addEventListener('click', function(e){
     var el = e.target;
     while (el && el.tagName !== 'A') el = el.parentElement;
     if (!el) return;
     var h = el.getAttribute('href');
     if (!h) return;
+    if (h.indexOf('javascript:') === 0 || h.indexOf('#') === 0) return;
     var nh = rw(h);
-    if (nh !== h){ e.preventDefault(); e.stopPropagation(); window.location.href = nh; }
+    if (nh !== h){
+      e.preventDefault();
+      e.stopPropagation();
+      window.location.href = nh;
+    }
   }, true);
+
+  // === 10. Intercept form submissions ===
+  document.addEventListener('submit', function(e){
+    try {
+      var f = e.target;
+      if (!f || f.tagName !== 'FORM') return;
+      var a = f.getAttribute('action');
+      if (a) f.setAttribute('action', rw(a));
+    } catch(err){}
+  }, true);
+
+  // === 11. Handle initial URL — strip /tb if somehow present ===
+  try {
+    // If URL is /tb/xxx and Testbook's Angular is about to run, hide /tb prefix from URL
+    // But keep it for refresh support via catch-all redirect.
+    // We do NOT strip here to keep things simple — Angular handles /tb/ base.
+  } catch(e){}
+
+  console.log('[TB Proxy] installed');
 })();
 """
 
 def rewrite_html(html: str, token: str) -> str:
-    # base tag
+    # 1. Remove meta refresh
+    html = re.sub(r'<meta[^>]*http-equiv=["\']refresh["\'][^>]*>', '', html, flags=re.IGNORECASE)
+
+    # 2. Ensure base href="/tb/"
     if re.search(r'<base\s', html, re.IGNORECASE):
         html = re.sub(r'<base[^>]*>', '<base href="/tb/">', html, count=1, flags=re.IGNORECASE)
     else:
         html = re.sub(r'(<head[^>]*>)', r'\1<base href="/tb/">', html, count=1, flags=re.IGNORECASE)
 
-    # absolute URL → relative proxy paths
+    # 3. String-level URL rewrites
     html = html.replace('https://api.testbook.com', '/tb-api')
     html = html.replace('http://api.testbook.com', '/tb-api')
     html = html.replace('//api.testbook.com', '/tb-api')
@@ -123,7 +209,7 @@ def rewrite_html(html: str, token: str) -> str:
     html = html.replace('http://testbook.com', '/tb')
     html = html.replace('//testbook.com', '/tb')
 
-    # relative attrs
+    # 4. Attribute-level rewrites (relative URLs)
     def repl(m):
         attr, path = m.group(1), m.group(2)
         if path.startswith('/tb/') or path.startswith('/tb-api/'):
@@ -134,10 +220,13 @@ def rewrite_html(html: str, token: str) -> str:
     html = re.sub(r'(href|src|action)="(/[^"]*)"', repl, html)
     html = re.sub(r"(href|src|action)='(/[^']*)'", repl, html)
 
-    # inject interceptor + cookie setter before </head>
-    inject = f'<script>{INTERCEPTOR}</script>'
-    cookie_js = f'<script>document.cookie="tb_token={token};path=/;max-age=604800;SameSite=Lax";window.__tbToken="{token}";</script>'
-    html = re.sub(r'</head>', inject + cookie_js + '</head>', html, count=1, flags=re.IGNORECASE)
+    # 5. Inject interceptor + token cookie setter FIRST in <head>
+    inject = (
+        f'<script>document.cookie="tb_token={token};path=/;max-age=604800;SameSite=Lax";'
+        f'window.__tbToken="{token}";</script>'
+        f'<script>{INTERCEPTOR}</script>'
+    )
+    html = re.sub(r'(<head[^>]*>)', r'\1' + inject, html, count=1, flags=re.IGNORECASE)
     return html
 
 def copy_cookies(resp, upstream):
@@ -173,7 +262,6 @@ async def login(token: str = Form(...)):
         return HTMLResponse(LOGIN_HTML.replace("__ERR__", '<div class="error">Token khali hai</div>'), status_code=400)
     if tok.lower().startswith("bearer "): tok = tok[7:].strip()
     if "auth_code=" in tok: tok = tok.split("auth_code=")[1].split("&")[0]
-    # validate
     try:
         async with httpx.AsyncClient(timeout=10) as c:
             r = await c.get(
@@ -182,7 +270,7 @@ async def login(token: str = Form(...)):
             if r.status_code != 200 or not r.json().get("success"):
                 return HTMLResponse(LOGIN_HTML.replace("__ERR__", '<div class="error">❌ Invalid ya expired token</div>'), status_code=401)
     except Exception as e:
-        return HTMLResponse(LOGIN_HTML.replace("__ERR__", f'<div class="error">Connection error: {e}</div>'), status_code=502)
+        return HTMLResponse(LOGIN_HTML.replace("__ERR__", f'<div class="error">Connection error</div>'), status_code=502)
     resp = RedirectResponse("/tb/online-test-series", status_code=303)
     resp.set_cookie("tb_session", sign(tok), httponly=True, samesite="lax", max_age=7*24*3600)
     return resp
@@ -198,12 +286,10 @@ async def logout():
 async def proxy_api(request: Request, path: str,
                     session_cookie: Optional[str] = Cookie(None, alias="tb_session")):
     token = get_token(session_cookie)
-    if not token:
-        return JSONResponse({"error": "not logged in"}, status_code=401)
+    if not token: return JSONResponse({"error": "not logged in"}, status_code=401)
     target = f"{API_BASE}/{path}"
     qs = request.url.query
-    if qs:
-        target += "?" + qs
+    if qs: target += "?" + qs
     if "auth_code=" not in target:
         sep = "&" if "?" in target else "?"
         target += f"{sep}auth_code={quote(token, safe='')}"
@@ -225,11 +311,9 @@ async def proxy_api(request: Request, path: str,
 async def proxy_page(request: Request, path: str,
                      session_cookie: Optional[str] = Cookie(None, alias="tb_session")):
     token = get_token(session_cookie)
-    if not token:
-        return RedirectResponse("/", status_code=302)
+    if not token: return RedirectResponse("/", status_code=302)
     target = f"{BASE_URL}/{path}"
-    if request.url.query:
-        target += "?" + request.url.query
+    if request.url.query: target += "?" + request.url.query
 
     body = await request.body()
     is_asset = bool(
@@ -248,7 +332,6 @@ async def proxy_page(request: Request, path: str,
     except Exception as e:
         return HTMLResponse(f"<h1>Upstream error</h1><pre>{e}</pre>", status_code=502)
 
-    # handle redirects
     if r.status_code in (301, 302, 303, 307, 308):
         loc = r.headers.get("location", "/")
         if loc.startswith(BASE_URL): loc = "/tb" + loc[len(BASE_URL):]
@@ -264,17 +347,24 @@ async def proxy_page(request: Request, path: str,
             html = rewrite_html(r.text, token)
         except Exception as e:
             html = f"<h1>Rewrite error</h1><pre>{e}</pre>"
-        resp = HTMLResponse(html, status_code=r.status_code)
+        resp = HTMLResponse(html, status_code=200)  # force 200 — Angular will show its own 404 if needed
         for h in ("x-frame-options", "content-security-policy", "content-security-policy-report-only"):
             if h in resp.headers: del resp.headers[h]
         return copy_cookies(resp, r)
 
-    # passthrough for non-HTML
     resp = FastResponse(content=r.content, status_code=r.status_code,
                         media_type=r.headers.get("content-type", "application/octet-stream"))
     for h in ("cache-control", "etag", "last-modified", "expires"):
         if r.headers.get(h): resp.headers[h] = r.headers[h]
     return copy_cookies(resp, r)
+
+# ---------- CATCH-ALL: refresh support ----------
+# Any URL that isn't our own route and isn't /tb/ or /tb-api/ → send to /tb/<same>
+@app.get("/{path:path}")
+async def catch_all(path: str, session_cookie: Optional[str] = Cookie(None, alias="tb_session")):
+    if not get_token(session_cookie):
+        return RedirectResponse("/", status_code=302)
+    return RedirectResponse(f"/tb/{path}", status_code=302)
 
 # ---------- login HTML ----------
 LOGIN_HTML = """<!DOCTYPE html>

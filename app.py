@@ -13,7 +13,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from typing import Optional, List, Dict, Any
 from urllib.parse import quote
 
-app = FastAPI(title="Testbook Mirror", version="28.0.0")
+app = FastAPI(title="Testbook Mirror", version="29.0.0")
 
 BASE_URL = "https://testbook.com"
 API_BASE = "https://api.testbook.com"
@@ -64,7 +64,7 @@ def validate_jwt(token: str):
 def get_user_info(token: str) -> dict:
     p = decode_jwt_payload(token) or {}
     return {"name": p.get("name") or "User", "email": p.get("email") or "",
-            "isPaid": p.get("isPaidUser", False)}
+            "isPaid": p.get("isPaidUser", False), "sub": p.get("sub") or ""}
 
 def tb_headers(token: str, json_accept: bool = True) -> Dict[str, str]:
     return {
@@ -108,7 +108,6 @@ async def fetch_series_list(token: str) -> List[Dict]:
             return results
     except Exception: return []
 
-# ---------- Test parser ----------
 def is_series_or_section(o):
     if not isinstance(o, dict): return False
     k = set(o.keys())
@@ -123,12 +122,10 @@ def find_all_tests(node: Any, out: List[dict], depth: int = 0):
     elif isinstance(node, dict):
         if not is_series_or_section(node):
             keys = set(node.keys())
-            has_id = "id" in keys or "_id" in keys
-            has_name = "title" in keys or "name" in keys
-            test_markers = {"questionCount", "totalQuestions", "duration", "totalMark", "totalMarks",
-                            "questions", "testType", "isFree", "questionsCount"}
-            if has_id and has_name and bool(keys & test_markers):
-                out.append(node)
+            if ("id" in keys or "_id" in keys) and ("title" in keys or "name" in keys):
+                markers = {"questionCount", "totalQuestions", "duration", "totalMark", "totalMarks", "testType"}
+                if keys & markers:
+                    out.append(node)
         for v in node.values():
             if isinstance(v, (list, dict)): find_all_tests(v, out, depth + 1)
 
@@ -138,23 +135,18 @@ def normalize_tests(raw: List[dict]) -> List[Dict]:
         tid = str(t.get("id") or t.get("_id") or "")
         if not tid or tid in seen: continue
         seen.add(tid)
-        result.append({
-            "id": tid,
-            "title": str(t.get("title") or t.get("name") or "Test"),
-            "questionCount": t.get("questionCount") or t.get("totalQuestions") or 0,
-            "duration": t.get("duration") or t.get("totalTime") or 0,
-            "totalMarks": t.get("totalMarks") or t.get("totalMark") or 0,
-            "isFree": bool(t.get("isFree") or False),
-        })
+        result.append({"id": tid, "title": str(t.get("title") or t.get("name") or "Test"),
+                       "questionCount": t.get("questionCount") or 0,
+                       "duration": t.get("duration") or 0,
+                       "totalMarks": t.get("totalMarks") or t.get("totalMark") or 0,
+                       "isFree": bool(t.get("isFree") or False)})
     return result
 
 async def fetch_all_tests_for_series(token: str, series_id: str) -> List[Dict]:
-    """Get tests list for a series via /live-panel/all."""
-    url = f"{ALL_API}?tsid={quote(series_id, safe='')}"
-    full = f"{url}&auth_code={quote(token, safe='')}&language=english"
+    url = f"{ALL_API}?tsid={quote(series_id, safe='')}&auth_code={quote(token, safe='')}&language=english"
     try:
         async with httpx.AsyncClient(timeout=20.0) as client:
-            r = await client.get(full, headers=tb_headers(token))
+            r = await client.get(url, headers=tb_headers(token))
             if r.status_code != 200: return []
             j = r.json()
             if not j.get("success"): return []
@@ -163,95 +155,81 @@ async def fetch_all_tests_for_series(token: str, series_id: str) -> List[Dict]:
             return normalize_tests(raw)
     except Exception: return []
 
-# ---------- TEST-TAKING: fetch questions ----------
-def build_question_urls(test_id: str) -> List[str]:
+# ==========================================
+# FOCUSED QUESTION FETCH — DUMP ALL BODIES
+# ==========================================
+async def probe_question_endpoints(token: str, test_id: str) -> Dict:
+    """Probe all question endpoints, dump actual response bodies."""
     s = quote(test_id, safe="")
-    return [
-        # Most likely candidates
+    result = {"tried": [], "questions": [], "winner": None}
+    
+    # GET endpoints
+    get_urls = [
         f"{API_BASE}/api/v2_1/tests/{s}",
-        f"{API_BASE}/api/v2_1/test/{s}",
-        f"{API_BASE}/api/v2_1/tests/{s}/details",
-        f"{API_BASE}/api/v2_1/tests/{s}/questions",
-        f"{API_BASE}/api/v2_1/test/{s}/questions",
-        f"{API_BASE}/api/v2_1/tests/{s}/question-paper",
-        f"{API_BASE}/api/v2_1/live-panel/tests/{s}",
-        f"{API_BASE}/api/v2_1/live-panel/tests/{s}/questions",
-        f"{API_BASE}/api/v2_1/live-panel/test/{s}",
         f"{API_BASE}/api/v2/tests/{s}",
-        f"{API_BASE}/api/v2/tests/{s}/questions",
-        f"{API_BASE}/api/v2/test/{s}",
-        f"{API_BASE}/api/v3/tests/{s}",
-        f"{API_BASE}/api/v3/tests/{s}/questions",
-        # Start/attempt based
+        f"{API_BASE}/api/v2_1/tests/{s}/question-paper",
+        f"{API_BASE}/api/v2_1/tests/{s}/paper",
+        f"{API_BASE}/api/v2_1/tests/{s}/questions",
         f"{API_BASE}/api/v2_1/tests/{s}/start",
-        f"{API_BASE}/api/v2_1/live-panel/tests/{s}/start",
+        f"{API_BASE}/api/v2_1/tests/{s}/attempt",
+        f"{API_BASE}/api/v2_1/tests/{s}/instructions",
+        f"{API_BASE}/api/v2_1/tests/{s}/details",
+        f"{API_BASE}/api/v2_1/tests/{s}/data",
+        f"{API_BASE}/api/v2_1/tests/{s}/test-data",
+        f"{API_BASE}/api/v2_1/question-paper/{s}",
+        f"{API_BASE}/api/v2_1/questionPapers/{s}",
+        f"{API_BASE}/api/v2_1/paper/{s}",
+        f"{API_BASE}/api/v2_1/test-attempt/{s}",
+        f"{API_BASE}/api/v2_1/testAttempt/{s}",
+        f"{API_BASE}/api/v2_1/attempts/{s}",
+    ]
+    # POST endpoints (start attempt)
+    post_urls = [
+        (f"{API_BASE}/api/v2_1/tests/{s}/start", {}),
+        (f"{API_BASE}/api/v2_1/tests/{s}/start", {"testId": test_id}),
+        (f"{API_BASE}/api/v2_1/tests/{s}/attempt", {}),
+        (f"{API_BASE}/api/v2_1/tests/{s}/attempt", {"testId": test_id}),
+        (f"{API_BASE}/api/v2_1/attempts", {"testId": test_id}),
+        (f"{API_BASE}/api/v2_1/attempts", {"test_id": test_id}),
+        (f"{API_BASE}/api/v2_1/live-panel/tests/{s}/start", {}),
+        (f"{API_BASE}/api/v2_1/live-panel/tests/{s}/start", {"testId": test_id}),
+        (f"{API_BASE}/api/v2_1/live-panel/attempt", {"testId": test_id}),
+        (f"{API_BASE}/api/v2_1/live-panel/attempt", {"tsid": test_id}),
+        (f"{API_BASE}/api/v2/attempts", {"testId": test_id}),
     ]
 
-def extract_questions(node: Any, out: List[dict], depth: int = 0) -> List[dict]:
-    """Recursively find question-like objects."""
-    if depth > 15: return out
-    if isinstance(node, list):
-        for x in node: extract_questions(x, out, depth + 1)
-    elif isinstance(node, dict):
-        keys = set(node.keys())
-        # A question has text + options
-        has_q = "question" in keys or "questionText" in keys or "text" in keys
-        has_opts = "options" in keys or "choices" in keys or "answers" in keys
-        if has_q and has_opts:
-            opts_raw = node.get("options") or node.get("choices") or []
-            opts = []
-            if isinstance(opts_raw, list):
-                for o in opts_raw:
-                    if isinstance(o, dict):
-                        opts.append(str(o.get("text") or o.get("value") or o.get("option") or o.get("answer") or str(o)))
-                    else:
-                        opts.append(str(o))
-            out.append({
-                "text": str(node.get("question") or node.get("questionText") or node.get("text") or ""),
-                "options": opts,
-                "correctAnswer": node.get("correctAnswer") or node.get("answer") or node.get("correct") or "",
-                "explanation": node.get("explanation") or node.get("solution") or "",
-            })
-        for v in node.values():
-            if isinstance(v, (list, dict)): extract_questions(v, out, depth + 1)
-    return out
-
-async def fetch_test_questions(token: str, test_id: str) -> tuple[List[Dict], str, int, Dict]:
-    """Try multiple endpoints to get questions for a test."""
-    debug = {"tried": [], "winner": None, "raw_count": 0}
-    urls = build_question_urls(test_id)
     async with httpx.AsyncClient(follow_redirects=True, timeout=8.0) as client:
-        # Try parallel
-        async def try_url(u):
+        # GET first
+        async def do_get(u):
             full = f"{u}{'&' if '?' in u else '?'}auth_code={quote(token, safe='')}&language=english"
             try:
                 r = await client.get(full, headers=tb_headers(token))
-                status = r.status_code
-                if status != 200:
-                    return {"url": u, "status": status, "questions": [], "raw_count": 0, "body": r.text[:150] if status != 404 else ""}
-                try:
-                    j = r.json()
-                except:
-                    return {"url": u, "status": status, "questions": [], "raw_count": 0}
-                raw: List[dict] = []
-                extract_questions(j, raw)
-                return {"url": u, "status": status, "questions": raw, "raw_count": len(raw),
-                        "data_keys": list(j.get("data", {}).keys()) if isinstance(j.get("data"), dict) else []}
+                body = r.text[:500] if r.status_code != 404 else ""
+                return {"method": "GET", "url": u, "status": r.status_code, "body": body}
             except Exception as e:
-                return {"url": u, "status": -1, "questions": [], "raw_count": 0, "error": str(e)[:100]}
+                return {"method": "GET", "url": u, "status": -1, "body": str(e)[:150]}
 
-        tasks = [try_url(u) for u in urls]
+        async def do_post(u, body):
+            full = f"{u}?auth_code={quote(token, safe='')}&language=english"
+            try:
+                r = await client.request("POST", full, headers=tb_headers(token), json=body)
+                body_txt = r.text[:500] if r.status_code != 404 else ""
+                return {"method": "POST", "url": u, "status": r.status_code, "body": body_txt, "req_body": body}
+            except Exception as e:
+                return {"method": "POST", "url": u, "status": -1, "body": str(e)[:150], "req_body": body}
+
+        tasks = [do_get(u) for u in get_urls] + [do_post(u, b) for u, b in post_urls]
         results = await asyncio.gather(*tasks, return_exceptions=True)
-
+        
         for res in results:
             if isinstance(res, Exception): continue
-            debug["tried"].append({"url": res["url"], "status": res["status"], "raw": res["raw_count"]})
-            if res["questions"] and not debug["winner"]:
-                debug["winner"] = res["url"]
-                debug["raw_count"] = res["raw_count"]
-                return res["questions"], res["url"], res["status"], debug
+            result["tried"].append({
+                "method": res["method"], "url": res["url"],
+                "status": res["status"], "body": res["body"][:250],
+                "req_body": res.get("req_body"),
+            })
 
-    return [], "none", 0, debug
+    return result
 
 # ---------- Error handlers ----------
 @app.exception_handler(StarletteHTTPException)
@@ -318,40 +296,6 @@ border-top-color:#4f46e5;border-radius:50%;animation:spin .8s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
 .loading-box{text-align:center;padding:50px 20px}
 .loading-box p{margin-top:16px;color:#718096;font-size:14px}
-/* Quiz UI */
-.quiz-header{background:#fff;border-radius:14px;padding:16px;margin-bottom:14px;
-box-shadow:0 2px 10px rgba(0,0,0,.06);position:sticky;top:66px;z-index:50}
-.quiz-header h2{font-size:15px;font-weight:700;color:#1a202c;margin-bottom:8px}
-.quiz-meta{display:flex;justify-content:space-between;font-size:12px;color:#718096}
-.timer{font-weight:700;color:#4f46e5}
-.q-card{background:#fff;border-radius:14px;padding:18px;margin-bottom:14px;
-box-shadow:0 2px 10px rgba(0,0,0,.06);border-top:3px solid #4f46e5}
-.q-num{display:inline-block;background:#4f46e5;color:#fff;font-size:11px;
-font-weight:700;padding:4px 10px;border-radius:8px;margin-bottom:10px}
-.q-text{font-size:15px;line-height:1.65;color:#2d3748;margin-bottom:14px}
-.opt{display:block;padding:13px 16px;background:#f7fafc;border-radius:10px;
-margin-bottom:10px;font-size:14px;color:#2d3748;border:2px solid #e2e8f0;
-cursor:pointer;transition:all .15s;user-select:none}
-.opt:hover{border-color:#a5b4fc;background:#f0f4ff}
-.opt.selected{border-color:#4f46e5;background:#eef2ff;font-weight:600}
-.opt.correct{border-color:#10b981;background:#d1fae5}
-.opt.wrong{border-color:#ef4444;background:#fee2e2}
-.opts-letter{display:inline-block;width:24px;height:24px;line-height:24px;
-text-align:center;background:#e2e8f0;border-radius:50%;font-size:12px;
-font-weight:700;margin-right:10px;color:#4a5568}
-.opt.selected .opts-letter{background:#4f46e5;color:#fff}
-.quiz-footer{background:#fff;border-radius:14px;padding:16px;margin-top:18px;
-box-shadow:0 2px 10px rgba(0,0,0,.06);display:flex;gap:10px;flex-wrap:wrap}
-.quiz-footer button{flex:1;min-width:120px;padding:13px;border:none;border-radius:10px;
-font-size:14px;font-weight:700;cursor:pointer}
-.submit-btn{background:#10b981;color:#fff}
-.submit-btn:hover{background:#059669}
-.reset-btn{background:#e2e8f0;color:#4a5568}
-.reset-btn:hover{background:#cbd5e0}
-.result-box{background:linear-gradient(135deg,#4f46e5,#7c3aed);color:#fff;
-padding:24px;border-radius:14px;text-align:center;margin-bottom:18px}
-.result-box .score{font-size:42px;font-weight:900;margin:8px 0}
-.result-box .lbl{font-size:13px;opacity:.9}
 """
 
 def shell(title: str, body: str) -> str:
@@ -395,7 +339,7 @@ __ERROR__
 
 # ---------- Routes ----------
 @app.get("/health")
-async def health(): return {"status":"ok","version":"28.0.0"}
+async def health(): return {"status":"ok","version":"29.0.0"}
 
 @app.get("/", response_class=HTMLResponse)
 async def root(error: Optional[str] = None,
@@ -493,8 +437,7 @@ async def series_page(id: str = Query(...),
           const box = document.getElementById('results');
           if (!data.tests || data.tests.length === 0) {{
             box.innerHTML = '<div class="empty"><h2>😕 Tests load nahi ho paye</h2>' +
-              '<p>' + (data.error || 'Koi test nahi mila') + '</p>' +
-              '<a href="/debug/probe" class="btn" style="margin-top:12px;">🔍 Debug</a></div>';
+              '<p>' + (data.error || 'Koi test nahi mila') + '</p></div>';
             return;
           }}
           let html = '<div class="section-title">📝 Tests (' + data.tests.length + ')</div><div class="row">';
@@ -531,7 +474,6 @@ async def api_series_tests(id: str = Query(...),
     except Exception as e:
         return {"tests": [], "error": str(e)}
 
-# ---------- TEST PAGE (our own quiz UI) ----------
 @app.get("/test", response_class=HTMLResponse)
 async def test_page(id: str = Query(...), name: str = Query(""),
                     session_cookie: Optional[str] = Cookie(None, alias="tb_session")):
@@ -546,9 +488,7 @@ async def test_page(id: str = Query(...), name: str = Query(""),
     </div>
     <div id="quiz"></div>
     <script>
-      const TEST_ID = {json.dumps(id)};
-      const TEST_NAME = {json.dumps(title)};
-      fetch('/api/test-questions?id=' + encodeURIComponent(TEST_ID))
+      fetch('/api/test-questions?id=' + encodeURIComponent({json.dumps(id)}))
         .then(r => r.json())
         .then(data => {{
           document.getElementById('loading').style.display = 'none';
@@ -556,8 +496,6 @@ async def test_page(id: str = Query(...), name: str = Query(""),
           if (!data.questions || data.questions.length === 0) {{
             box.innerHTML = '<div class="empty"><h2>😕 Questions load nahi ho paye</h2>' +
               '<p>' + (data.error || 'Is test ka question data API se nahi mila') + '</p>' +
-              '<p style="margin-top:12px;font-size:11px;">Status: ' + (data.status || '?') +
-              ' | Winner: ' + (data.winner || 'none') + '</p>' +
               '<a href="/debug/probe" class="btn" style="margin-top:12px;">🔍 Debug</a></div>';
             return;
           }}
@@ -567,18 +505,13 @@ async def test_page(id: str = Query(...), name: str = Query(""),
           document.getElementById('loading').style.display = 'none';
           document.getElementById('quiz').innerHTML = '<div class="empty"><h2>Error</h2><p>' + e + '</p></div>';
         }});
-
       function renderQuiz(questions) {{
-        const answers = {{}};
-        let html = '<div class="quiz-header">' +
-          '<h2>' + TEST_NAME + '</h2>' +
+        window.__answers = {{}}; window.__questions = questions;
+        let html = '<div class="quiz-header"><h2>' + {json.dumps(title)} + '</h2>' +
           '<div class="quiz-meta"><span>📝 Total: ' + questions.length + ' questions</span>' +
-          '<span class="timer" id="answered">Answered: 0</span></div>' +
-          '</div>';
-
+          '<span class="timer" id="answered">Answered: 0</span></div></div>';
         questions.forEach((q, i) => {{
-          html += '<div class="q-card">' +
-            '<span class="q-num">Q' + (i+1) + '</span>' +
+          html += '<div class="q-card"><span class="q-num">Q' + (i+1) + '</span>' +
             '<div class="q-text">' + escapeHtml(q.text) + '</div>';
           const letters = ['A','B','C','D','E','F'];
           (q.options || []).forEach((opt, j) => {{
@@ -588,50 +521,35 @@ async def test_page(id: str = Query(...), name: str = Query(""),
           }});
           html += '</div>';
         }});
-
         html += '<div class="quiz-footer">' +
           '<button class="submit-btn" onclick="submitQuiz(' + questions.length + ')">✅ Submit Test</button>' +
-          '<button class="reset-btn" onclick="window.location.reload()">🔄 Reset</button>' +
-          '</div>';
-
+          '<button class="reset-btn" onclick="window.location.reload()">🔄 Reset</button></div>';
         document.getElementById('quiz').innerHTML = html;
-        window.__answers = answers;
-        window.__questions = questions;
       }}
-
       function selectOption(el, q, o) {{
-        const all = document.querySelectorAll('.opt[data-q="' + q + '"]');
-        all.forEach(a => a.classList.remove('selected'));
+        document.querySelectorAll('.opt[data-q="' + q + '"]').forEach(a => a.classList.remove('selected'));
         el.classList.add('selected');
         window.__answers[q] = o;
         document.getElementById('answered').textContent = 'Answered: ' + Object.keys(window.__answers).length;
       }}
-
       function submitQuiz(total) {{
-        const answers = window.__answers || {{}};
-        const questions = window.__questions || [];
+        const answers = window.__answers || {{}}, questions = window.__questions || [];
         let correct = 0, attempted = Object.keys(answers).length;
         questions.forEach((q, i) => {{
-          const correctIdx = findCorrectIndex(q);
-          if (correctIdx >= 0 && answers[i] === correctIdx) correct++;
-          // Highlight correct/wrong
-          const opts = document.querySelectorAll('.opt[data-q="' + i + '"]');
-          opts.forEach((el, j) => {{
+          const ci = findCorrectIndex(q);
+          if (ci >= 0 && answers[i] === ci) correct++;
+          document.querySelectorAll('.opt[data-q="' + i + '"]').forEach((el, j) => {{
             el.style.pointerEvents = 'none';
-            if (j === correctIdx) el.classList.add('correct');
-            else if (answers[i] === j && j !== correctIdx) el.classList.add('wrong');
+            if (j === ci) el.classList.add('correct');
+            else if (answers[i] === j && j !== ci) el.classList.add('wrong');
           }});
         }});
-
-        const resultBox = document.createElement('div');
-        resultBox.className = 'result-box';
-        resultBox.innerHTML = '<div class="lbl">Your Score</div>' +
-          '<div class="score">' + correct + ' / ' + total + '</div>' +
-          '<div class="lbl">Attempted: ' + attempted + ' | Correct: ' + correct +
-          ' | Wrong: ' + (attempted - correct) + '</div>';
-        document.getElementById('quiz').insertBefore(resultBox, document.getElementById('quiz').firstChild);
+        const rb = document.createElement('div');
+        rb.className = 'result-box';
+        rb.innerHTML = '<div class="lbl">Your Score</div><div class="score">' + correct + ' / ' + total + '</div>' +
+          '<div class="lbl">Attempted: ' + attempted + ' | Correct: ' + correct + ' | Wrong: ' + (attempted - correct) + '</div>';
+        document.getElementById('quiz').insertBefore(rb, document.getElementById('quiz').firstChild);
       }}
-
       function findCorrectIndex(q) {{
         if (!q.correctAnswer) return -1;
         const ca = String(q.correctAnswer).trim().toLowerCase();
@@ -640,32 +558,24 @@ async def test_page(id: str = Query(...), name: str = Query(""),
         }}
         return -1;
       }}
-
-      function escapeHtml(s) {{
-        const d = document.createElement('div');
-        d.textContent = s;
-        return d.innerHTML;
-      }}
+      function escapeHtml(s) {{ const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }}
     </script>"""
     return HTMLResponse(shell(title, body))
 
-# ---------- API: test questions ----------
 @app.get("/api/test-questions")
 async def api_test_questions(id: str = Query(...),
                              session_cookie: Optional[str] = Cookie(None, alias="tb_session")):
     token = get_token(session_cookie)
     if not token: return JSONResponse({"error": "not logged in", "questions": []}, status_code=401)
     try:
-        questions, winner, status, debug = await asyncio.wait_for(
-            fetch_test_questions(token, id), timeout=30.0)
-        return {"questions": questions, "count": len(questions),
-                "winner": winner, "status": status}
+        result = await asyncio.wait_for(probe_question_endpoints(token, id), timeout=30.0)
+        return {"questions": result.get("questions", []), "count": len(result.get("questions", []))}
     except asyncio.TimeoutError:
         return {"questions": [], "error": "Timeout"}
     except Exception as e:
         return {"questions": [], "error": str(e)}
 
-# ---------- Debug ----------
+# ---------- FULL DEBUG: dump ALL bodies ----------
 @app.get("/debug/probe", response_class=HTMLResponse)
 async def probe(session_cookie: Optional[str] = Cookie(None, alias="tb_session")):
     token = get_token(session_cookie)
@@ -676,7 +586,6 @@ async def probe(session_cookie: Optional[str] = Cookie(None, alias="tb_session")
 
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
-            # Get a live test from series
             r = await client.get(f"{SERIES_LIST_API}?exam=rrb-group-d&auth_code={quote(token,safe='')}", headers=tb_headers(token))
             ts = r.json().get("data", {}).get("testSeries", [])
             if ts:
@@ -687,27 +596,38 @@ async def probe(session_cookie: Optional[str] = Cookie(None, alias="tb_session")
                 live = data.get("liveTests", [])
                 if live:
                     test_id = live[0]["id"]
-                    lines.append(f"Testing with: {live[0]['title']}")
-                    lines.append(f"Test ID: {test_id}")
+                    lines.append(f"Test: {live[0]['title']}")
+                    lines.append(f"ID: {test_id}")
                     lines.append("")
 
-                    questions, winner, status, dbg = await fetch_test_questions(token, test_id)
-                    lines.append(f"=== RESULT ===")
-                    lines.append(f"Winner: {winner}")
-                    lines.append(f"Status: {status}")
-                    lines.append(f"Questions found: {len(questions)}")
-                    lines.append("")
-                    lines.append("=== ENDPOINTS TRIED ===")
-                    for t in dbg["tried"]:
-                        lines.append(f"  [{t['status']}] raw={t['raw']}  {t['url'][:100]}")
-                    if questions:
+                    result = await probe_question_endpoints(token, test_id)
+                    lines.append(f"=== ALL BODIES (250 chars) ===\n")
+
+                    for t in result["tried"]:
+                        st = t["status"]
+                        if st == 200:
+                            lines.append(f"✅ [{st}] {t['method']}  {t['url'][:95]}")
+                        elif st in (400, 401, 403, 405):
+                            lines.append(f"⚠️  [{st}] {t['method']}  {t['url'][:95]}")
+                        elif st == 0:
+                            lines.append(f"💥 [ERR] {t['method']}  {t['url'][:95]}")
+                        else:
+                            continue  # skip 404s
+                        if t.get("req_body"):
+                            lines.append(f"      REQ: {json.dumps(t['req_body'], ensure_ascii=False)[:150]}")
+                        if t["body"]:
+                            lines.append(f"      BODY: {t['body'][:220]}")
                         lines.append("")
-                        lines.append("=== FIRST QUESTION ===")
-                        lines.append(json.dumps(questions[0], ensure_ascii=False, indent=2)[:600])
+
+                    # Summary
+                    lines.append("=== SUMMARY ===")
+                    for st in [200, 400, 401, 403, 405, 500]:
+                        count = sum(1 for x in result["tried"] if x["status"] == st)
+                        if count: lines.append(f"  Status {st}: {count} URLs")
     except Exception as e:
         lines.append(f"ERR: {e}")
 
     body = f"""<a href="/dashboard" class="back-btn">← Back</a>
-    <div class="info-box">🎯 Test questions — {len(build_question_urls('X'))} URLs tried</div>
+    <div class="info-box">🎯 Question endpoints — ALL bodies dumped, no 404 spam</div>
     <div class="debug">{chr(10).join(lines)}</div>"""
     return HTMLResponse(shell("Debug", body))

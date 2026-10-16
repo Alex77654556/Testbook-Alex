@@ -8,7 +8,7 @@ import base64
 import hashlib
 import traceback
 import httpx
-from fastapi import FastAPI, HTTPException, Response as FastResponse, Form, Cookie, Query, Request
+from fastapi import FastAPI, HTTPException, Form, Cookie, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from bs4 import BeautifulSoup
@@ -16,7 +16,7 @@ from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 from urllib.parse import quote
 
-app = FastAPI(title="Testbook Mirror", version="5.0.0")
+app = FastAPI(title="Testbook Mirror", version="5.5.0")
 
 # ---------- Config ----------
 BASE_URL = "https://testbook.com"
@@ -26,10 +26,37 @@ SESSION_SECRET = os.getenv("SESSION_SECRET", "testbook-secret-98765")
 UA = ("Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36")
 
-# Testbook API endpoints (with auth_code param)
 COUNT_API = f"{API_BASE}/api/v2_1/live-panel/count"
-USER_API = f"{API_BASE}/api/v2/users/me"
-SERIES_API = f"{API_BASE}/api/v2_1/live-panel/test-series"
+
+# ---- Series endpoint candidates (broad list) ----
+SERIES_CANDIDATES = [
+    f"{API_BASE}/api/v2_1/live-panel/test-series",
+    f"{API_BASE}/api/v2_1/live-panel/series",
+    f"{API_BASE}/api/v2_1/live-panel/my-series",
+    f"{API_BASE}/api/v2_1/live-panel/purchased-series",
+    f"{API_BASE}/api/v2_1/live-panel/purchasedTestSeries",
+    f"{API_BASE}/api/v2_1/live-panel/user-test-series",
+    f"{API_BASE}/api/v2_1/live-panel/courses",
+    f"{API_BASE}/api/v2_1/live-panel/dashboard",
+    f"{API_BASE}/api/v2_1/live-panel/home",
+    f"{API_BASE}/api/v2_1/live-panel",
+    f"{API_BASE}/api/v2_1/me/test-series",
+    f"{API_BASE}/api/v2_1/user/test-series",
+    f"{API_BASE}/api/v2_1/users/me/test-series",
+    f"{API_BASE}/api/v2_1/me/series",
+    f"{API_BASE}/api/v2_1/test-series/my",
+    f"{API_BASE}/api/v2_1/test-series/purchased",
+    f"{API_BASE}/api/v2_1/test-series",
+    f"{API_BASE}/api/v2/test-series/my",
+    f"{API_BASE}/api/v2/user/test-series",
+    f"{API_BASE}/api/v2/me/test-series",
+    f"{API_BASE}/api/v2/users/me/test-series",
+    f"{API_BASE}/api/v2/me/courses",
+    f"{API_BASE}/api/v2/user/courses",
+    f"{API_BASE}/api/v2/me/purchased",
+    f"{API_BASE}/api/v3/test-series/my",
+    f"{API_BASE}/api/v3/me/test-series",
+]
 
 # ---------- Token helpers ----------
 def sign_token(token: str) -> str:
@@ -52,16 +79,13 @@ def get_token(session_cookie: Optional[str]) -> Optional[str]:
         return None
     return unsign_token(session_cookie)
 
-# ---------- JWT decoding ----------
 def decode_jwt_payload(token: str) -> Optional[dict]:
     try:
         parts = token.split(".")
         if len(parts) != 3:
             return None
-        payload = parts[1]
-        payload += "=" * (-len(payload) % 4)
-        decoded = base64.urlsafe_b64decode(payload)
-        return json.loads(decoded)
+        payload = parts[1] + "=" * (-len(parts[1]) % 4)
+        return json.loads(base64.urlsafe_b64decode(payload))
     except Exception:
         return None
 
@@ -72,22 +96,18 @@ def validate_jwt(token: str) -> tuple[bool, str]:
     exp = payload.get("exp")
     if exp and isinstance(exp, (int, float)) and exp < time.time():
         return False, "Token expire ho gaya hai"
-    user_keys = ("sub", "email", "phone", "userId", "name", "mobile")
-    if not any(k in payload for k in user_keys):
+    if not any(k in payload for k in ("sub", "email", "name", "phone")):
         return False, "Token me user info nahi mili"
     return True, "ok"
 
 def get_user_info(token: str) -> dict:
-    payload = decode_jwt_payload(token) or {}
+    p = decode_jwt_payload(token) or {}
     return {
-        "name": payload.get("name") or "User",
-        "email": payload.get("email") or "",
-        "phone": payload.get("phone") or payload.get("mobile") or "",
-        "sub": payload.get("sub") or "",
-        "isPaid": payload.get("isPaidUser", False),
+        "name": p.get("name") or "User",
+        "email": p.get("email") or "",
+        "sub": p.get("sub") or "",
     }
 
-# ---------- API headers ----------
 def tb_headers(token: str) -> Dict[str, str]:
     return {
         "Authorization": f"Bearer {token}",
@@ -99,9 +119,8 @@ def tb_headers(token: str) -> Dict[str, str]:
         "Cookie": f"tb_token={token}",
     }
 
-# ---------- Fetch live stats ----------
+# ---------- Stats ----------
 async def fetch_stats(token: str) -> Optional[dict]:
-    """Fetch user's live test/quiz counts from Testbook API."""
     url = f"{COUNT_API}?auth_code={quote(token, safe='')}&language=english"
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
@@ -114,31 +133,7 @@ async def fetch_stats(token: str) -> Optional[dict]:
         print("stats error:", e)
     return None
 
-# ---------- Fetch test series from API ----------
-async def fetch_series_api(token: str) -> List[dict]:
-    """Try Testbook API endpoints for test series."""
-    candidates = [
-        f"{API_BASE}/api/v2_1/live-panel/test-series?auth_code={quote(token, safe='')}",
-        f"{API_BASE}/api/v2_1/test-series?auth_code={quote(token, safe='')}",
-        f"{API_BASE}/api/v2/test-series/my?auth_code={quote(token, safe='')}",
-        f"{API_BASE}/api/v3/test-series/my?auth_code={quote(token, safe='')}",
-    ]
-    async with httpx.AsyncClient(follow_redirects=True, timeout=15.0) as client:
-        for url in candidates:
-            try:
-                r = await client.get(url, headers=tb_headers(token))
-                if r.status_code == 200:
-                    try:
-                        j = r.json()
-                    except Exception:
-                        continue
-                    series = _extract_series(j)
-                    if series:
-                        return series
-            except Exception:
-                continue
-    return []
-
+# ---------- JSON extractors ----------
 def _looks_like_series(o: Any) -> bool:
     if not isinstance(o, dict):
         return False
@@ -147,19 +142,18 @@ def _looks_like_series(o: Any) -> bool:
     has_title = bool(keys & {"name", "title", "seriesName", "testSeriesName"})
     return has_id and has_title
 
-def _extract_series(node: Any, out: List[dict], depth: int = 0) -> List[dict]:
-    if depth > 6:
-        return out
+def _walk(node: Any, out: List[dict], depth: int = 0):
+    if depth > 8:
+        return
     if isinstance(node, list):
         for x in node:
-            _extract_series(x, out, depth + 1)
+            _walk(x, out, depth + 1)
     elif isinstance(node, dict):
         if _looks_like_series(node):
             out.append(node)
         for v in node.values():
             if isinstance(v, (list, dict)):
-                _extract_series(v, out, depth + 1)
-    return out
+                _walk(v, out, depth + 1)
 
 def normalize_series(items: List[dict]) -> List[Dict]:
     seen, result = set(), []
@@ -169,19 +163,106 @@ def normalize_series(items: List[dict]) -> List[Dict]:
             continue
         seen.add(sid)
         title = str(it.get("name") or it.get("title") or it.get("seriesName") or "Test Series")
-        desc = str(it.get("description") or it.get("shortDescription") or it.get("subTitle") or "")[:300]
+        desc = str(it.get("description") or it.get("shortDescription") or it.get("subTitle") or "")[:200]
         slug = it.get("slug") or it.get("url") or ""
         if slug.startswith("http"):
             link = slug
         elif slug:
-            link = f"{BASE_URL}/test-series/{slug}" if "/test-series/" not in slug else f"{BASE_URL}{slug}"
+            link = f"{BASE_URL}{slug}" if slug.startswith("/") else f"{BASE_URL}/test-series/{slug}"
         else:
             link = f"{BASE_URL}/test-series/{sid}"
         result.append({"id": sid, "title": title, "description": desc, "link": link})
     return result
 
-# ---------- Fallback HTML parse ----------
+# ---------- Series fetch: API ----------
+async def probe_endpoint(client: httpx.AsyncClient, url: str, token: str) -> dict:
+    """Hit endpoint, return dict with status + brief."""
+    full = f"{url}?auth_code={quote(token, safe='')}&language=english"
+    try:
+        r = await client.get(full, headers=tb_headers(token))
+        info = {"url": url, "status": r.status_code, "len": len(r.content)}
+        if r.status_code == 200:
+            try:
+                j = r.json()
+                info["success"] = j.get("success")
+                raw = []
+                _walk(j, raw)
+                info["series_found"] = len(raw)
+                info["preview"] = json.dumps(j, ensure_ascii=False)[:300]
+            except Exception:
+                info["preview"] = r.text[:200]
+        else:
+            info["preview"] = r.text[:200]
+        return info
+    except Exception as e:
+        return {"url": url, "status": "ERR", "error": str(e)}
+
+async def fetch_series_api(token: str) -> tuple[List[Dict], str]:
+    """Try each candidate; return (series, endpoint_used)."""
+    async with httpx.AsyncClient(follow_redirects=True, timeout=12.0) as client:
+        for url in SERIES_CANDIDATES:
+            try:
+                full = f"{url}?auth_code={quote(token, safe='')}&language=english"
+                r = await client.get(full, headers=tb_headers(token))
+                if r.status_code != 200:
+                    continue
+                try:
+                    j = r.json()
+                except Exception:
+                    continue
+                raw: List[dict] = []
+                _walk(j, raw)
+                if raw:
+                    return normalize_series(raw), url
+            except Exception:
+                continue
+    return [], "none"
+
+# ---------- Series fetch: HTML + TransferState ----------
+def parse_transfer_state(html_text: str) -> Optional[dict]:
+    """Angular Universal stores data in <script id="serverApp-state">."""
+    soup = BeautifulSoup(html_text, "html.parser")
+
+    # 1. Angular TransferState
+    for sc in soup.find_all("script"):
+        sid = sc.get("id") or ""
+        stype = sc.get("type") or ""
+        if "state" in sid.lower() and "json" in stype:
+            try:
+                return json.loads(sc.string or "")
+            except Exception:
+                pass
+
+    # 2. window.__INITIAL_STATE__ / __data / similar
+    for sc in soup.find_all("script"):
+        txt = sc.string or ""
+        for var in ("__INITIAL_STATE__", "window.__data", "__DATA__", "window.__STATE__"):
+            m = re.search(re.escape(var) + r"\s*=\s*(\{.*?\});?\s*(?:</script>|$)", txt, re.DOTALL)
+            if m:
+                try:
+                    return json.loads(m.group(1))
+                except Exception:
+                    pass
+
+    # 3. Generic JSON blobs in script tags with JSON mime
+    for sc in soup.find_all("script", type="application/json"):
+        try:
+            return json.loads(sc.string or "")
+        except Exception:
+            continue
+    return None
+
 def parse_series_html(html_text: str) -> List[Dict]:
+    """Fallback: scrape links + try TransferState."""
+    # First try TransferState
+    state = parse_transfer_state(html_text)
+    if state:
+        raw: List[dict] = []
+        _walk(state, raw)
+        if raw:
+            return normalize_series(raw)
+
+    # Otherwise scrape anchors
     soup = BeautifulSoup(html_text, "html.parser")
     results, seen = [], set()
     for a in soup.select("a[href]"):
@@ -198,15 +279,12 @@ def parse_series_html(html_text: str) -> List[Dict]:
         results.append({"id": absolute, "title": text, "description": "", "link": absolute})
     return results
 
-# ---------- Global error handler ----------
+# ---------- Error handlers ----------
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     tb = traceback.format_exc()
     print("ERROR:", tb)
-    return HTMLResponse(
-        f"<h1>Error</h1><pre style='white-space:pre-wrap'>{tb}</pre>",
-        status_code=500,
-    )
+    return HTMLResponse(f"<h1>Error</h1><pre style='white-space:pre-wrap'>{tb}</pre>", status_code=500)
 
 @app.exception_handler(StarletteHTTPException)
 async def custom_http_exception_handler(request: Request, exc: StarletteHTTPException):
@@ -241,7 +319,7 @@ transition:transform .15s,box-shadow .15s}
 font-weight:700;padding:3px 10px;border-radius:12px;margin-top:8px;
 text-transform:uppercase;letter-spacing:.3px}
 .row{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:14px}
-.empty{text-align:center;padding:50px 20px;color:#a0aec0}
+.empty{text-align:center;padding:40px 20px;color:#a0aec0}
 .empty h2{font-size:18px;margin-bottom:8px;color:#4a5568}
 .btn{display:inline-block;padding:11px 20px;background:#4f46e5;color:#fff;
 border:none;border-radius:10px;font-size:14px;font-weight:600;text-decoration:none;
@@ -262,10 +340,10 @@ box-shadow:0 2px 8px rgba(0,0,0,.05);flex:1;min-width:130px;text-align:center}
 .stat .lbl{font-size:12px;color:#718096;text-transform:uppercase;
 letter-spacing:.4px;margin-top:4px}
 .debug{background:#1a202c;color:#a0aec0;padding:16px;border-radius:10px;
-font-family:monospace;font-size:12px;overflow:auto;max-height:400px;
-line-height:1.6;white-space:pre-wrap}
-.user-chip{background:rgba(255,255,255,.2);padding:7px 12px;border-radius:20px;
-font-size:12px;font-weight:600}
+font-family:monospace;font-size:11px;overflow:auto;max-height:520px;
+line-height:1.5;white-space:pre-wrap;word-break:break-word}
+.ok{color:#10b981;font-weight:700}
+.bad{color:#ef4444;font-weight:700}
 """
 
 def page_shell(title: str, body: str) -> str:
@@ -312,7 +390,7 @@ font-size:13px;margin-bottom:16px;border:1px solid #fed7d7;text-align:center}
 <div class="card">
 <div class="logo">🔐</div>
 <h1>Testbook Token Login</h1>
-<p class="sub">Sirf valid token hi accept hoga (JWT structure + expiry check).</p>
+<p class="sub">Sirf valid token hi accept hoga (JWT + expiry + API check).</p>
 __ERROR__
 <form method="post" action="/login">
 <label>Access Token</label>
@@ -332,16 +410,14 @@ __ERROR__
 # ---------- Routes ----------
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "5.0.0"}
+    return {"status": "ok", "version": "5.5.0"}
 
 @app.get("/", response_class=HTMLResponse)
 async def root(error: Optional[str] = None,
                session_cookie: Optional[str] = Cookie(None, alias="tb_session")):
     if get_token(session_cookie):
         return RedirectResponse("/dashboard", status_code=302)
-    err = ""
-    if error == "session":
-        err = '<div class="error">Token expire ho gaya. Dobara login karein.</div>'
+    err = '<div class="error">Token expire ho gaya. Dobara login karein.</div>' if error == "session" else ""
     return HTMLResponse(LOGIN_HTML.replace("__ERROR__", err))
 
 @app.post("/login")
@@ -351,7 +427,6 @@ async def login(token: str = Form(...)):
         return HTMLResponse(LOGIN_HTML.replace("__ERROR__", '<div class="error">Token khali hai.</div>'), status_code=400)
     if token.lower().startswith("bearer "):
         token = token[7:].strip()
-    # strip query params if user pasted full URL
     if "auth_code=" in token:
         token = token.split("auth_code=")[1].split("&")[0]
 
@@ -359,13 +434,11 @@ async def login(token: str = Form(...)):
     if not ok:
         return HTMLResponse(LOGIN_HTML.replace("__ERROR__", f'<div class="error">❌ {msg}</div>'), status_code=401)
 
-    # Validate token by hitting live-panel API
     stats = await fetch_stats(token)
     if stats is None:
         return HTMLResponse(
             LOGIN_HTML.replace("__ERROR__",
-                '<div class="error">❌ Token Testbook API ne accept nahi kiya. '
-                'Dobara check karein ki token sahi hai aur expire nahi hua.</div>'),
+                '<div class="error">❌ Token Testbook API ne accept nahi kiya.</div>'),
             status_code=401,
         )
 
@@ -388,25 +461,25 @@ async def dashboard(debug: int = 0,
 
     user = get_user_info(token)
     stats = await fetch_stats(token)
-    series = await fetch_series_api(token)
-    source = "api"
+
+    # Try API, then HTML+TransferState
+    series, endpoint = await fetch_series_api(token)
+    source = f"api:{endpoint}"
 
     if not series:
-        # Fallback to HTML
         try:
             async with httpx.AsyncClient(follow_redirects=True, timeout=25.0) as client:
                 r = await client.get(BASE_URL + HOME_PATH, headers=tb_headers(token))
             if r.status_code == 200:
                 series = parse_series_html(r.text)
-                source = "html"
-        except Exception:
-            pass
+                source = f"html ({len(series)})"
+        except Exception as e:
+            source = f"html error: {e}"
 
     debug_html = ""
     if debug == 1:
-        debug_html = f'<div class="debug">{json.dumps({"stats": stats, "series_count": len(series), "series_sample": series[:3]}, indent=2, ensure_ascii=False)}</div>'
+        debug_html = f'<div class="debug">source: {source}\n\nseries_count: {len(series)}\n\nseries_sample:\n{json.dumps(series[:5], indent=2, ensure_ascii=False)}</div>'
 
-    # Stats cards
     stats_html = ""
     if stats:
         stats_html = f"""
@@ -417,12 +490,10 @@ async def dashboard(debug: int = 0,
         </div>
         """
 
-    # User greeting
     greeting = f"""
     <div class="info-box">
       ✅ <b>Welcome, {user['name']}!</b><br>
-      {user['email']}<br>
-      Aapka Testbook account successfully connect ho gaya hai.
+      {user['email']}
     </div>
     """
 
@@ -430,7 +501,7 @@ async def dashboard(debug: int = 0,
         cards = "".join(
             f'<div class="card"><a href="{item["link"]}" target="_blank">'
             f'<h3>{item["title"]}</h3>'
-            f'{f"<p>{item[chr(34)+chr(100)+chr(101)+chr(115)+chr(99)+chr(114)+chr(105)+chr(112)+chr(116)+chr(105)+chr(111)+chr(110)+chr(34)]}</p>" if item.get("description") else ""}'
+            f'{f"<p>{item[chr(100)+chr(101)+chr(115)+chr(99)+chr(114)+chr(105)+chr(112)+chr(116)+chr(105)+chr(111)+chr(110)]}</p>" if item.get("description") else ""}'
             f'<span class="badge">Test Series</span></a></div>'
             for item in series
         )
@@ -447,14 +518,50 @@ async def dashboard(debug: int = 0,
         {stats_html}
         <div class="empty">
           <h2>😕 Koi test series nahi mili</h2>
-          <p>API se data fetch nahi ho paya. Aapka token valid hai (stats aa gaye), lekin series list ka endpoint alag ho sakta hai.</p>
+          <p>Token sahi hai (stats aa gaye), lekin series ka endpoint nahi mila.</p>
+          <p style="margin-top:8px;font-size:12px;">Source: <b>{source}</b></p>
           <br>
-          <a href="/dashboard?debug=1" class="btn" style="margin-right:8px;">🔍 Debug Info</a>
-          <a href="{BASE_URL + HOME_PATH}" target="_blank" class="btn gray">🔗 Original Page</a>
+          <a href="/debug/probe" class="btn" style="margin-right:8px;">🔍 Endpoint Probe</a>
+          <a href="/dashboard?debug=1" class="btn gray">Refresh</a>
         </div>
         {debug_html}
         """
     return HTMLResponse(page_shell("Dashboard", body))
+
+# ---------- Debug: probe all endpoints ----------
+@app.get("/debug/probe", response_class=HTMLResponse)
+async def debug_probe(session_cookie: Optional[str] = Cookie(None, alias="tb_session")):
+    token = get_token(session_cookie)
+    if not token:
+        return RedirectResponse("/", status_code=302)
+
+    results = []
+    async with httpx.AsyncClient(follow_redirects=True, timeout=10.0) as client:
+        for url in SERIES_CANDIDATES:
+            info = await probe_endpoint(client, url, token)
+            results.append(info)
+
+    lines = []
+    for r in results:
+        status = r.get("status")
+        if status == 200 and r.get("series_found", 0) > 0:
+            tag = f'<span class="ok">✅ [{status}] series={r["series_found"]}</span>'
+        elif status == 200:
+            tag = f'<span class="bad">⚠️  [{status}]</span>'
+        else:
+            tag = f'<span class="bad">❌ [{status}]</span>'
+        lines.append(f'{tag}  {r["url"]}')
+        prev = r.get("preview") or r.get("error") or ""
+        if prev:
+            lines.append(f'      {prev[:180]}')
+        lines.append("")
+
+    body = f"""
+    <div style="margin-bottom:14px;"><a href="/dashboard" class="btn gray" style="padding:8px 16px;font-size:13px;">← Back</a></div>
+    <div class="info-box">Yahan har candidate endpoint ka result hai. Jo endpoint <span class="ok">✅ series=N</span> de, wo use ho raha hai.</div>
+    <div class="debug">{chr(10).join(lines)}</div>
+    """
+    return HTMLResponse(page_shell("Probe", body))
 
 # ---------- JSON API ----------
 class TestInfo(BaseModel):
@@ -470,8 +577,8 @@ class ScrapeResult(BaseModel):
 async def api_tests(session_cookie: Optional[str] = Cookie(None, alias="tb_session")):
     token = get_token(session_cookie)
     if not token:
-        raise HTTPException(401, "Pehle '/' par jaake login karein.")
-    series = await fetch_series_api(token)
+        raise HTTPException(401, "Pehle login karein.")
+    series, _ = await fetch_series_api(token)
     return ScrapeResult(
         count=len(series),
         tests=[TestInfo(title=s["title"], link=s["link"], description=s.get("description") or None) for s in series],

@@ -13,7 +13,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from typing import Optional, List, Dict, Any
 from urllib.parse import quote
 
-app = FastAPI(title="Testbook Mirror", version="26.0.0")
+app = FastAPI(title="Testbook Mirror", version="27.0.0")
 
 BASE_URL = "https://testbook.com"
 API_BASE = "https://api.testbook.com"
@@ -120,15 +120,11 @@ def is_series_or_section(o):
     return False
 
 def find_all_tests(node: Any, out: List[dict], depth: int = 0):
-    """Recursively find test-like objects."""
     if depth > 15: return
     if isinstance(node, list):
         for x in node: find_all_tests(x, out, depth + 1)
     elif isinstance(node, dict):
-        if is_series_or_section(node):
-            # Don't recurse into these as tests
-            pass
-        else:
+        if not is_series_or_section(node):
             keys = set(node.keys())
             has_id = "id" in keys or "_id" in keys or "testId" in keys
             has_name = "name" in keys or "title" in keys or "testName" in keys
@@ -139,7 +135,7 @@ def find_all_tests(node: Any, out: List[dict], depth: int = 0):
                 "questions", "testType", "test_type", "attempted", "isAttempted",
                 "difficultyLevel", "isFree", "freeTest", "paidTest",
                 "testCategory", "startTime", "endTime", "liveStatus",
-                "testName", "testId", "totalQuestionsCount", "totalTime",
+                "testName", "testId", "totalQuestionsCount",
             }
             if has_id and has_name and bool(keys & test_markers):
                 out.append(node)
@@ -154,95 +150,109 @@ def normalize_tests(raw: List[dict]) -> List[Dict]:
         seen.add(tid)
         result.append({
             "id": tid,
-            "title": str(t.get("name") or t.get("title") or t.get("testName") or "Test"),
+            "title": str(t.get("title") or t.get("name") or t.get("testName") or "Test"),
             "questionCount": (t.get("questionCount") or t.get("totalQuestions")
                               or t.get("questionsCount") or t.get("questions")
                               or t.get("totalQuestionsCount") or t.get("numQuestions") or 0),
             "duration": t.get("duration") or t.get("totalTime") or t.get("time") or t.get("testDuration") or 0,
-            "totalMarks": t.get("totalMarks") or t.get("marks") or t.get("maxMarks") or t.get("correctMarks") or 0,
+            "totalMarks": t.get("totalMarks") or t.get("totalMark") or t.get("marks") or t.get("maxMarks") or t.get("correctMarks") or 0,
             "isFree": bool(t.get("isFree") or t.get("freeTest") or False),
-            "raw_type": t.get("testType") or t.get("test_type") or "",
         })
     return result
 
-# ---------- Fetch ALL tests via /live-panel/all?tsid= ----------
-async def fetch_all_tests_via_all_api(token: str, series_id: str) -> tuple[List[Dict], Dict]:
-    """Use the working endpoint /api/v2_1/live-panel/all?tsid={series_id}."""
-    debug = {"url": None, "status": 0, "raw_count": 0, "body_keys": [],
-             "response_size": 0, "pagination_info": None}
-    url = f"{ALL_API}?tsid={quote(series_id, safe='')}"
-    full = f"{url}&auth_code={quote(token, safe='')}&language=english"
-    debug["url"] = url
+# ---------- THE MAGIC: probe /live-panel/all with all param combos ----------
+def build_magic_urls(series_id: str, section_id: str, subsection_id: str, super_section_id: str) -> List[Dict]:
+    s = quote(series_id, safe="")
+    sec = quote(section_id, safe="") if section_id else ""
+    sub = quote(subsection_id, safe="") if subsection_id else ""
+    ss = quote(super_section_id, safe="") if super_section_id else ""
+
+    urls = []
+    base = f"{API_BASE}/api/v2_1/live-panel/all"
+    
+    # Every possible param name for section
+    section_params = ["sid", "sectionId", "section_id", "secId", "sec_id", "section", "sec"]
+    sub_params = ["ssid", "subsectionId", "sub_id", "subSectionId", "subId", "subsection", "sub"]
+    super_params = ["supersid", "superSectionId", "supersection_id", "super_id", "superId"]
+
+    # /all with section params only
+    for p in section_params:
+        if sec: urls.append({"m": "GET", "u": f"{base}?tsid={s}&{p}={sec}"})
+    # /all with sub params only
+    for p in sub_params:
+        if sub: urls.append({"m": "GET", "u": f"{base}?tsid={s}&{p}={sub}"})
+    # /all with super section
+    for p in super_params:
+        if ss: urls.append({"m": "GET", "u": f"{base}?tsid={s}&{p}={ss}"})
+    # /all with section + sub combos
+    for p1 in ("sid", "sectionId", "secId"):
+        for p2 in ("ssid", "subsectionId", "subId"):
+            if sec and sub:
+                urls.append({"m": "GET", "u": f"{base}?tsid={s}&{p1}={sec}&{p2}={sub}"})
+
+    # Other live-panel endpoints with section/subsection
+    for ep in ["section", "sections", "subsection", "subsections",
+               "content", "home", "dashboard", "panel", "series",
+               "test-series", "tests", "test-list"]:
+        if sec: urls.append({"m": "GET", "u": f"{API_BASE}/api/v2_1/live-panel/{ep}?tsid={s}&sid={sec}"})
+        if sub: urls.append({"m": "GET", "u": f"{API_BASE}/api/v2_1/live-panel/{ep}?tsid={s}&ssid={sub}"})
+
+    # Section path with tsid param
+    if sec:
+        urls.append({"m": "GET", "u": f"{API_BASE}/api/v2_1/live-panel/section/{sec}?tsid={s}"})
+        urls.append({"m": "GET", "u": f"{API_BASE}/api/v2_1/live-panel/section/{sec}/tests?tsid={s}"})
+        urls.append({"m": "GET", "u": f"{API_BASE}/api/v2_1/live-panel/section/{sec}/all?tsid={s}"})
+    if sub:
+        urls.append({"m": "GET", "u": f"{API_BASE}/api/v2_1/live-panel/subsection/{sub}?tsid={s}"})
+        urls.append({"m": "GET", "u": f"{API_BASE}/api/v2_1/live-panel/subsection/{sub}/tests?tsid={s}"})
+        urls.append({"m": "GET", "u": f"{API_BASE}/api/v2_1/live-panel/subsection/{sub}/all?tsid={s}"})
+
+    # section id as tsid
+    if sec:
+        urls.append({"m": "GET", "u": f"{base}?tsid={sec}"})
+    if sub:
+        urls.append({"m": "GET", "u": f"{base}?tsid={sub}"})
+
+    return urls
+
+async def probe_one(client: httpx.AsyncClient, token: str, entry: Dict) -> Dict:
+    method = entry["m"]
+    url = entry["u"]
+    result = {"entry": entry, "status": 0, "raw": 0, "tests": [], "body": "", "data_keys": []}
     try:
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            r = await client.get(full, headers=tb_headers(token))
-            debug["status"] = r.status_code
-            debug["response_size"] = len(r.content)
-            if r.status_code != 200:
-                return [], debug
-            j = r.json()
-            if not isinstance(j, dict):
-                return [], debug
-            if not j.get("success"):
-                return [], debug
-
-            data = j.get("data", {})
-            debug["body_keys"] = list(data.keys()) if isinstance(data, dict) else []
-
-            # Check for pagination info
-            if isinstance(data, dict):
-                for k in ("total", "count", "page", "pages", "totalCount", "pagination"):
-                    if k in data:
-                        debug.setdefault("pagination_info", {})[k] = data[k]
-
-            raw: List[dict] = []
-            find_all_tests(data, raw)
-            debug["raw_count"] = len(raw)
-            tests = normalize_tests(raw)
-            return tests, debug
-    except Exception as e:
-        debug["error"] = str(e)
-        return [], debug
-
-# ---------- Fallback: pagination try ----------
-async def fetch_all_tests_paginated(token: str, series_id: str) -> tuple[List[Dict], Dict]:
-    """Try paginated fetches in case endpoint returns only first page."""
-    all_tests: List[Dict] = []
-    seen = set()
-    debug = {"pages_tried": 0, "total_fetched": 0}
-    for page in range(1, 11):  # up to 10 pages
-        url = f"{ALL_API}?tsid={quote(series_id, safe='')}&page={page}&limit=100"
-        full = f"{url}&auth_code={quote(token, safe='')}&language=english"
-        try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                r = await client.get(full, headers=tb_headers(token))
-                if r.status_code != 200: break
+        full = f"{url}{'&' if '?' in url else '?'}auth_code={quote(token, safe='')}&language=english"
+        r = await client.get(full, headers=tb_headers(token))
+        result["status"] = r.status_code
+        if r.status_code == 200:
+            try:
                 j = r.json()
-                if not j.get("success"): break
-                data = j.get("data", {})
-                raw: List[dict] = []
-                find_all_tests(data, raw)
-                tests = normalize_tests(raw)
-                debug["pages_tried"] += 1
-                new_count = 0
-                for t in tests:
-                    if t["id"] not in seen:
-                        seen.add(t["id"])
-                        all_tests.append(t)
-                        new_count += 1
-                debug["total_fetched"] = len(all_tests)
-                if new_count == 0:
-                    break  # No new tests, stop
-        except Exception:
-            break
-    return all_tests, debug
+                if isinstance(j, dict):
+                    data = j.get("data", {})
+                    if isinstance(data, dict):
+                        result["data_keys"] = list(data.keys())
+                    raw: List[dict] = []
+                    find_all_tests(data if data else j, raw)
+                    result["raw"] = len(raw)
+                    result["tests"] = normalize_tests(raw)
+            except Exception:
+                pass
+        elif r.status_code in (400, 403, 405):
+            result["body"] = r.text[:250].replace("\n", " ")
+        return result
+    except Exception as e:
+        result["status"] = -1
+        result["body"] = str(e)[:200]
+        return result
 
 # ---------- Main fetch ----------
 async def fetch_series_tests(token: str, series_id: str) -> tuple[List[Dict], Dict, Optional[Dict]]:
-    debug = {"mode": "unknown", "tests_found": 0}
+    debug = {"mode": "unknown", "all_endpoints": [], "winners": []}
 
     # Series info
     series_info = {"id": series_id, "title": "Test Series"}
+    section_id = ""
+    subsection_id = ""
+    super_section_id = ""
     try:
         url = f"{API_BASE}/api/v2_1/test-series/{quote(series_id, safe='')}?auth_code={quote(token, safe='')}&language=english"
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -250,28 +260,58 @@ async def fetch_series_tests(token: str, series_id: str) -> tuple[List[Dict], Di
             if r.status_code == 200:
                 j = r.json()
                 if j.get("success"):
-                    d = j.get("data", {}).get("details", {})
-                    series_info["title"] = d.get("name") or "Test Series"
-    except Exception: pass
+                    data = j.get("data", {})
+                    details = data.get("details", {})
+                    series_info["title"] = details.get("name") or "Test Series"
+                    # Get first section + subsection with tests
+                    for sec in details.get("sections", []):
+                        for sub in sec.get("subsections", []):
+                            if (sub.get("paidTestCount") or 0) + (sub.get("freeTestCount") or 0) > 0:
+                                section_id = sec.get("id", "")
+                                subsection_id = sub.get("id", "")
+                                break
+                        if section_id: break
+                    # Get superSection
+                    supers = details.get("superSections", [])
+                    if supers:
+                        super_section_id = supers[0].get("id", "")
+    except Exception:
+        pass
 
-    # ⚡ PRIMARY: /live-panel/all?tsid=
-    tests, all_debug = await fetch_all_tests_via_all_api(token, series_id)
-    debug["all_api"] = all_debug
-    debug["mode"] = "live-panel-all"
-    debug["tests_found"] = len(tests)
+    debug["section_id"] = section_id
+    debug["subsection_id"] = subsection_id
+    debug["super_section_id"] = super_section_id
 
-    if tests:
-        return tests, debug, series_info
+    # ⚡ Probe magic URLs
+    urls = build_magic_urls(series_id, section_id, subsection_id, super_section_id)
+    debug["total_urls"] = len(urls)
 
-    # FALLBACK: paginated
-    tests2, page_debug = await fetch_all_tests_paginated(token, series_id)
-    debug["paginated"] = page_debug
-    if tests2:
-        debug["mode"] = "live-panel-all-paginated"
-        debug["tests_found"] = len(tests2)
-        return tests2, debug, series_info
+    async with httpx.AsyncClient(follow_redirects=True, timeout=8.0) as c:
+        tasks = [probe_one(c, token, e) for e in urls]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    return [], debug, series_info
+    all_tests = []
+    seen = set()
+    for res in results:
+        if isinstance(res, Exception): continue
+        entry = res["entry"]
+        debug["all_endpoints"].append({
+            "u": entry["u"][:100], "status": res["status"],
+            "raw": res["raw"], "keys": res["data_keys"][:5]
+        })
+        if res["tests"]:
+            debug["winners"].append({
+                "url": entry["u"][:120], "count": len(res["tests"]),
+                "keys": res["data_keys"][:5]
+            })
+            for t in res["tests"]:
+                if t["id"] not in seen:
+                    seen.add(t["id"])
+                    all_tests.append(t)
+
+    debug["mode"] = f"found-{len(all_tests)}" if all_tests else "none"
+    debug["tests_found"] = len(all_tests)
+    return all_tests, debug, series_info
 
 # ---------- Error handlers ----------
 @app.exception_handler(StarletteHTTPException)
@@ -381,7 +421,7 @@ __ERROR__
 
 # ---------- Routes ----------
 @app.get("/health")
-async def health(): return {"status":"ok","version":"26.0.0"}
+async def health(): return {"status":"ok","version":"27.0.0"}
 
 @app.get("/", response_class=HTMLResponse)
 async def root(error: Optional[str] = None,
@@ -512,7 +552,7 @@ async def api_series_tests(id: str = Query(...),
     try:
         tests, debug, info = await asyncio.wait_for(fetch_series_tests(token, id), timeout=45.0)
         return {"tests": tests, "count": len(tests), "mode": debug.get("mode"),
-                "tests_found": debug.get("tests_found", 0), "error": debug.get("error")}
+                "winners": debug.get("winners", []), "error": debug.get("error")}
     except asyncio.TimeoutError:
         return {"tests": [], "error": "Timeout 45s"}
     except Exception as e:
@@ -534,7 +574,7 @@ async def test_page(id: str = Query(...), name: str = Query(""),
     </div>"""
     return HTMLResponse(shell(title, body))
 
-# ---------- Debug: what /live-panel/all returns ----------
+# ---------- Debug: magic probe ----------
 @app.get("/debug/probe", response_class=HTMLResponse)
 async def probe(session_cookie: Optional[str] = Cookie(None, alias="tb_session")):
     token = get_token(session_cookie)
@@ -547,7 +587,6 @@ async def probe(session_cookie: Optional[str] = Cookie(None, alias="tb_session")
 
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
-            # Get first series
             r = await client.get(f"{SERIES_LIST_API}?exam=rrb-group-d&auth_code={quote(token,safe='')}", headers=tb_headers(token))
             j = r.json()
             ts = j.get("data",{}).get("testSeries",[])
@@ -557,49 +596,64 @@ async def probe(session_cookie: Optional[str] = Cookie(None, alias="tb_session")
                 sid = ts[0]["details"]["id"]
                 lines.append(f"Series: {ts[0]['details']['name']}")
                 lines.append(f"ID: {sid}")
+
+                # Get section + subsection + superSection
+                r2 = await client.get(f"{API_BASE}/api/v2_1/test-series/{sid}?auth_code={quote(token,safe='')}", headers=tb_headers(token))
+                details = r2.json().get("data", {}).get("details", {})
+                sec_id = sub_id = ss_id = ""
+                sec_name = sub_name = ""
+                for sec in details.get("sections", []):
+                    for sub in sec.get("subsections", []):
+                        if (sub.get("paidTestCount") or 0) + (sub.get("freeTestCount") or 0) > 0:
+                            sec_id = sec.get("id", "")
+                            sub_id = sub.get("id", "")
+                            sec_name = sec.get("name", "")
+                            sub_name = sub.get("name", "")
+                            break
+                    if sec_id: break
+                supers = details.get("superSections", [])
+                if supers: ss_id = supers[0].get("id", "")
+
+                lines.append(f"\nSection: {sec_name} ({sec_id})")
+                lines.append(f"Subsection: {sub_name} ({sub_id})")
+                lines.append(f"SuperSection: {supers[0].get('name') if supers else 'n/a'} ({ss_id})")
                 lines.append("")
 
-                # 🎯 THE WORKING ENDPOINT
-                url = f"{ALL_API}?tsid={quote(sid, safe='')}"
-                full = f"{url}&auth_code={quote(token, safe='')}&language=english"
-                lines.append(f"🎯 WORKING ENDPOINT: {url}")
-                lines.append("")
+                urls = build_magic_urls(sid, sec_id, sub_id, ss_id)
+                lines.append(f"=== PROBING {len(urls)} MAGIC URLS ===\n")
 
-                rr = await client.get(full, headers=tb_headers(token))
-                lines.append(f"Status: {rr.status_code} | Size: {len(rr.content)} bytes")
-                if rr.status_code == 200:
-                    jj = rr.json()
-                    lines.append(f"success: {jj.get('success')}")
-                    data = jj.get("data", {})
-                    lines.append(f"data type: {type(data).__name__}")
-                    if isinstance(data, dict):
-                        lines.append(f"data keys: {list(data.keys())}")
-                        for k, v in data.items():
-                            if isinstance(v, list):
-                                lines.append(f"\n  [{k}] list len={len(v)}")
-                                if v and isinstance(v[0], dict):
-                                    lines.append(f"      first item keys: {list(v[0].keys())}")
-                                    lines.append(f"      first item: {json.dumps(v[0], ensure_ascii=False)[:400]}")
-                                    lines.append(f"      second item: {json.dumps(v[1], ensure_ascii=False)[:400] if len(v)>1 else 'n/a'}")
-                            elif isinstance(v, dict):
-                                lines.append(f"\n  [{k}] dict keys={list(v.keys())[:20]}")
-                                lines.append(f"      sample: {json.dumps(v, ensure_ascii=False)[:300]}")
-                            else:
-                                lines.append(f"\n  [{k}] = {str(v)[:150]}")
+                async with httpx.AsyncClient(follow_redirects=True, timeout=8.0) as c:
+                    tasks = [probe_one(c, token, e) for e in urls]
+                    results = await asyncio.gather(*tasks, return_exceptions=True)
 
-                    # Run finder
-                    raw: List[dict] = []
-                    find_all_tests(data, raw)
-                    lines.append(f"\n=== FINDER RESULT ===")
-                    lines.append(f"Raw tests found: {len(raw)}")
-                    tests = normalize_tests(raw)
-                    lines.append(f"Normalized: {len(tests)}")
-                    for t in tests[:15]:
-                        lines.append(f"  → {t['title'][:70]} | {t['questionCount']} Qs")
+                winners = []
+                for res in results:
+                    if isinstance(res, Exception): continue
+                    if res["tests"]:
+                        winners.append(res)
+
+                if winners:
+                    lines.append(f"🎉 WINNERS ({len(winners)}):\n")
+                    for w in winners:
+                        lines.append(f"✅ status={w['status']} count={len(w['tests'])} keys={w['data_keys']}")
+                        lines.append(f"   {w['entry']['u']}")
+                        lines.append(f"   First: {json.dumps(w['tests'][0], ensure_ascii=False)[:200]}")
+                        lines.append("")
+                else:
+                    lines.append("❌ No winners. Top responses:\n")
+                    for res in results:
+                        if isinstance(res, Exception): continue
+                        if res["status"] == 200:
+                            lines.append(f"[200] keys={res['data_keys']} raw={res['raw']}")
+                            lines.append(f"      {res['entry']['u']}")
+                        elif res["status"] in (400, 403, 405):
+                            lines.append(f"[{res['status']}] {res['entry']['u'][:100]}")
+                            if res.get("body"):
+                                lines.append(f"      BODY: {res['body'][:180]}")
     except Exception as e:
         lines.append(f"ERR: {e}")
 
     body = f"""<a href="/dashboard" class="back-btn">← Back</a>
-    <div class="info-box">🎯 FINAL — /live-panel/all?tsid= endpoint ka pura structure</div>
+    <div class="info-box">🎯 MAGIC PROBE — /live-panel/all with section/subsection params</div>
     <div class="debug">{chr(10).join(lines)}</div>"""
-    return HTMLResponse(shell("Debug", body))
+    return HTMLResponse(shell("Magic Debug", body))

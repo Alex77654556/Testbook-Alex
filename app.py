@@ -12,18 +12,18 @@ from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from bs4 import BeautifulSoup
 from typing import Optional, List, Dict, Any
-from urllib.parse import quote
+from urllib.parse import quote, urljoin, urlparse
 
-app = FastAPI(title="Testbook Mirror", version="8.0.0")
+app = FastAPI(title="Testbook Mirror", version="9.0.0")
 
 BASE_URL = "https://testbook.com"
 API_BASE = "https://api.testbook.com"
-HOME_PATH = "/rrb-group-d/test-series/my"
 SESSION_SECRET = os.getenv("SESSION_SECRET", "testbook-secret-98765")
 UA = ("Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36")
 
 COUNT_API = f"{API_BASE}/api/v2_1/live-panel/count"
+SERIES_API = f"{API_BASE}/api/v2_1/test-series?exam=rrb-group-d"
 
 # ---------- Token helpers ----------
 def sign_token(token: str) -> str:
@@ -101,188 +101,70 @@ async def fetch_stats(token: str) -> Optional[dict]:
         print("stats error:", e)
     return None
 
-# ---------- JSON walker ----------
-def _looks_like_series(o):
-    if not isinstance(o, dict): return False
-    keys = set(o.keys())
-    has_id = bool(keys & {"id","_id","slug","seriesId","testSeriesId","series_id"})
-    has_title = bool(keys & {"name","title","seriesName","testSeriesName","series_name"})
-    return has_id and has_title
+# ---------- Series API ----------
+async def fetch_series(token: str) -> List[Dict]:
+    """Fetch series from the discovered working endpoint."""
+    url = f"{SERIES_API}&auth_code={quote(token, safe='')}&language=english"
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            r = await client.get(url, headers=tb_headers(token))
+            if r.status_code != 200:
+                return []
+            j = r.json()
+            if not j.get("success"):
+                return []
+            data = j.get("data", {})
+            series_list = data.get("testSeries", [])
 
-def _looks_like_test(o):
-    if not isinstance(o, dict): return False
-    keys = set(o.keys())
-    has_id = bool(keys & {"id","_id","slug","testId"})
-    has_title = bool(keys & {"name","title","testName"})
-    return has_id and has_title
-
-def _walk(node, out, pred, depth=0):
-    if depth > 10: return
-    if isinstance(node, list):
-        for x in node: _walk(x, out, pred, depth+1)
-    elif isinstance(node, dict):
-        if pred(node): out.append(node)
-        for v in node.values():
-            if isinstance(v, (list, dict)): _walk(v, out, pred, depth+1)
-
-def normalize_series(items: List[dict]) -> List[Dict]:
-    seen, result = set(), []
-    for it in items:
-        sid = str(it.get("slug") or it.get("id") or it.get("_id") or it.get("seriesId") or it.get("testSeriesId") or "")
-        if not sid or sid in seen: continue
-        seen.add(sid)
-        title = str(it.get("name") or it.get("title") or it.get("seriesName") or it.get("testSeriesName") or "Test Series")
-        desc = str(it.get("description") or it.get("shortDescription") or it.get("subTitle") or "")[:300]
-        result.append({"id": sid, "title": title, "description": desc})
-    return result
-
-# ---------- Endpoint discovery ----------
-def build_endpoints(user_id: str) -> List[str]:
-    """Generate many endpoint candidates."""
-    uid = quote(user_id, safe="")
-    eps = [
-        # v2_1 live-panel variants
-        f"{API_BASE}/api/v2_1/live-panel/dashboard",
-        f"{API_BASE}/api/v2_1/live-panel/home",
-        f"{API_BASE}/api/v2_1/live-panel/user",
-        f"{API_BASE}/api/v2_1/live-panel/series-count",
-        f"{API_BASE}/api/v2_1/live-panel/panel",
-        f"{API_BASE}/api/v2_1/live-panel/panel-data",
-        f"{API_BASE}/api/v2_1/live-panel/tests-series",
-        # v2_1 me/* paths
-        f"{API_BASE}/api/v2_1/me/dashboard",
-        f"{API_BASE}/api/v2_1/me/home",
-        f"{API_BASE}/api/v2_1/me/series",
-        f"{API_BASE}/api/v2_1/me/tests",
-        f"{API_BASE}/api/v2_1/me/attempted",
-        f"{API_BASE}/api/v2_1/me/attempted-tests",
-        f"{API_BASE}/api/v2_1/me/purchased-tests",
-        f"{API_BASE}/api/v2_1/me/purchased",
-        # user-based
-        f"{API_BASE}/api/v2_1/users/{uid}",
-        f"{API_BASE}/api/v2_1/users/{uid}/dashboard",
-        f"{API_BASE}/api/v2_1/users/{uid}/test-series",
-        f"{API_BASE}/api/v2_1/user/{uid}/dashboard",
-        f"{API_BASE}/api/v2_1/user/{uid}/test-series",
-        f"{API_BASE}/api/v2/users/{uid}/dashboard",
-        f"{API_BASE}/api/v2/users/{uid}/test-series",
-        f"{API_BASE}/api/v2/users/{uid}/purchased-series",
-        f"{API_BASE}/api/v2/users/{uid}/my-series",
-        # v2 dashboards
-        f"{API_BASE}/api/v2/dashboard",
-        f"{API_BASE}/api/v2/me/dashboard",
-        f"{API_BASE}/api/v2/user/dashboard",
-        f"{API_BASE}/api/v2/me",
-        f"{API_BASE}/api/v2/users/me",
-        f"{API_BASE}/api/v2/user/my-test-series",
-        f"{API_BASE}/api/v2/me/test-series",
-        f"{API_BASE}/api/v2/user/test-series",
-        # v3
-        f"{API_BASE}/api/v3/me/dashboard",
-        f"{API_BASE}/api/v3/users/me",
-        f"{API_BASE}/api/v3/user/test-series",
-        # Exam-based
-        f"{API_BASE}/api/v2_1/exams/rrb-group-d",
-        f"{API_BASE}/api/v2_1/exam/rrb-group-d",
-        # Test series by exam
-        f"{API_BASE}/api/v2_1/test-series?exam=rrb-group-d",
-        f"{API_BASE}/api/v2_1/test-series?examSlug=rrb-group-d",
-        f"{API_BASE}/api/v2_1/test-series?examId=rrb-group-d",
-    ]
-    return eps
-
-async def find_series(token: str, user_id: str) -> tuple[List[Dict], str]:
-    """Try every endpoint, return (series, endpoint_used)."""
-    async with httpx.AsyncClient(follow_redirects=True, timeout=12.0) as client:
-        for base_url in build_endpoints(user_id):
-            for auth_style in ("param", "header"):
-                try:
-                    if auth_style == "param":
-                        sep = "&" if "?" in base_url else "?"
-                        full = f"{base_url}{sep}auth_code={quote(token, safe='')}&language=english"
-                        r = await client.get(full, headers=tb_headers(token))
-                    else:
-                        r = await client.get(base_url, headers=tb_headers(token))
-                    if r.status_code != 200:
-                        continue
-                    try:
-                        j = r.json()
-                    except Exception:
-                        continue
-                    raw: List[dict] = []
-                    _walk(j, raw, _looks_like_series)
-                    if raw:
-                        return normalize_series(raw), f"{base_url} [{auth_style}]"
-                except Exception:
+            results, seen = [], set()
+            for item in series_list:
+                d = item.get("details", {})
+                sid = str(d.get("slug") or d.get("id") or d.get("_id") or "")
+                if not sid or sid in seen:
                     continue
-    return [], "none"
+                seen.add(sid)
+                title = str(d.get("name") or d.get("title") or "Test Series")
+                desc = str(d.get("description") or d.get("shortDescription") or "")[:250]
+                total_tests = d.get("totalTests") or d.get("testsCount") or 0
+                results.append({
+                    "id": sid,
+                    "title": title,
+                    "description": desc,
+                    "totalTests": total_tests,
+                })
+            return results
+    except Exception as e:
+        print("series fetch error:", e)
+        return []
 
-# ---------- HTML deep parsing ----------
-def parse_html_for_series(html_text: str) -> List[Dict]:
-    """Multi-strategy parser for Testbook SSR HTML."""
-    results, seen = [], set()
-
-    # Strategy 1: JSON blobs in <script> tags
+# ---------- HTML fallback for series detail ----------
+def parse_tests_from_html(html_text: str) -> List[Dict]:
     soup = BeautifulSoup(html_text, "html.parser")
-    for sc in soup.find_all("script"):
-        txt = sc.string or ""
-        if not txt or len(txt) < 50:
-            continue
-        # Look for window.__... = {...} patterns
-        for var in ("__INITIAL_STATE__", "__APP_STATE__", "__DATA__", "__NG_STATE__",
-                    "window.__data", "window.state", "__REDUX_STATE__"):
-            m = re.search(re.escape(var) + r"\s*=\s*(\{.*?\});", txt, re.DOTALL)
-            if m:
-                try:
-                    data = json.loads(m.group(1))
-                    raw: List[dict] = []
-                    _walk(data, raw, _looks_like_series)
-                    for x in normalize_series(raw):
-                        if x["id"] not in seen:
-                            seen.add(x["id"])
-                            results.append(x)
-                except Exception:
-                    pass
-        # Look for JSON with "testSeries" key
-        try:
-            if '"testSeries"' in txt or '"test_series"' in txt:
-                # Extract any JSON-ish object
-                for m in re.finditer(r'(\{[^{}]*"testSeries"[^{}]*\[[^\]]*\][^{}]*\})', txt, re.DOTALL):
-                    pass  # complex, skip
-        except Exception:
-            pass
-
-    # Strategy 2: Angular TransferState (script id="...-state" type="application/json")
-    for sc in soup.find_all("script", type="application/json"):
-        try:
-            data = json.loads(sc.string or "")
-            raw: List[dict] = []
-            _walk(data, raw, _looks_like_series)
-            for x in normalize_series(raw):
-                if x["id"] not in seen:
-                    seen.add(x["id"])
-                    results.append(x)
-        except Exception:
-            continue
-
-    # Strategy 3: Anchor tags
+    results, seen = [], set()
     for a in soup.select("a[href]"):
         href = a.get("href", "")
         text = a.get_text(" ", strip=True)
         if not text or len(text) < 4:
             continue
-        if "/test-series/" not in href or "/my" in href:
+        if "/tests/" not in href and "/take-test" not in href:
             continue
-        # Skip if link is to a specific test (has /tests/ in path)
         absolute = href if href.startswith("http") else BASE_URL + href
         if absolute in seen:
             continue
         seen.add(absolute)
-        # Extract slug
         slug = absolute.rstrip("/").split("/")[-1]
-        results.append({"id": slug, "title": text, "description": ""})
-
+        results.append({"id": slug, "title": text, "url": absolute})
     return results
+
+def parse_series_page(html_text: str) -> Dict:
+    soup = BeautifulSoup(html_text, "html.parser")
+    title = "Test Series"
+    if soup.title and soup.title.string:
+        title = soup.title.string.strip()
+    h1 = soup.find("h1")
+    if h1:
+        title = h1.get_text(strip=True)
+    return {"title": title}
 
 # ---------- Error handlers ----------
 @app.exception_handler(StarletteHTTPException)
@@ -317,7 +199,8 @@ transition:transform .15s,box-shadow .15s}
 .badge{display:inline-block;background:#eef2ff;color:#4f46e5;font-size:11px;
 font-weight:700;padding:3px 10px;border-radius:12px;margin-top:8px;
 text-transform:uppercase;letter-spacing:.3px}
-.row{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:14px}
+.badge.green{background:#d1fae5;color:#059669}
+.row{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:14px}
 .empty{text-align:center;padding:40px 20px;color:#a0aec0}
 .empty h2{font-size:18px;margin-bottom:8px;color:#4a5568}
 .btn{display:inline-block;padding:11px 20px;background:#4f46e5;color:#fff;
@@ -341,6 +224,16 @@ letter-spacing:.4px;margin-top:4px}
 .debug{background:#1a202c;color:#a0aec0;padding:16px;border-radius:10px;
 font-family:monospace;font-size:11px;overflow:auto;max-height:520px;
 line-height:1.5;white-space:pre-wrap;word-break:break-word}
+.q-card{background:#fff;border-radius:12px;padding:18px;margin-bottom:14px;
+box-shadow:0 2px 8px rgba(0,0,0,.06);border-top:3px solid #4f46e5}
+.q-num{display:inline-block;background:#4f46e5;color:#fff;font-size:11px;
+font-weight:700;padding:3px 10px;border-radius:8px;margin-bottom:10px}
+.q-text{font-size:15px;line-height:1.6;color:#2d3748;margin-bottom:12px}
+.opt{display:block;padding:11px 14px;background:#f7fafc;border-radius:9px;
+margin-bottom:8px;font-size:14px;color:#2d3748;border:1.5px solid #e2e8f0}
+.back-btn{display:inline-block;margin-bottom:14px;padding:8px 16px;
+background:#e2e8f0;color:#4a5568;border-radius:8px;text-decoration:none;
+font-size:13px;font-weight:600}
 """
 
 def shell(title: str, body: str) -> str:
@@ -390,7 +283,7 @@ __ERROR__
 
 # ---------- Routes ----------
 @app.get("/health")
-async def health(): return {"status":"ok","version":"8.0.0"}
+async def health(): return {"status":"ok","version":"9.0.0"}
 
 @app.get("/", response_class=HTMLResponse)
 async def root(error: Optional[str] = None,
@@ -434,24 +327,11 @@ async def dashboard(debug: int = 0,
 
     user = get_user_info(token)
     stats = await fetch_stats(token)
-
-    # Try API endpoints first
-    series, endpoint = await find_series(token, user["userId"])
-
-    # Fallback: fetch HTML and parse deeply
-    if not series:
-        try:
-            async with httpx.AsyncClient(follow_redirects=True, timeout=25.0) as client:
-                r = await client.get(BASE_URL + HOME_PATH, headers=tb_headers(token, json_accept=False))
-            if r.status_code == 200:
-                series = parse_html_for_series(r.text)
-                endpoint = f"html-parse ({len(series)} found, len={len(r.text)})"
-        except Exception as e:
-            endpoint = f"html err: {e}"
+    series = await fetch_series(token)
 
     debug_html = ""
     if debug == 1:
-        debug_html = f'<div class="debug">endpoint: {endpoint}\nseries: {len(series)}\n\n{json.dumps(series[:5], indent=2, ensure_ascii=False)}</div>'
+        debug_html = f'<div class="debug">series_count: {len(series)}\n\n{json.dumps(series[:5], indent=2, ensure_ascii=False)}</div>'
 
     stats_html = ""
     if stats:
@@ -464,69 +344,143 @@ async def dashboard(debug: int = 0,
     greeting = f'<div class="info-box">✅ <b>Welcome, {user["name"]}!</b><br>{user["email"]}</div>'
 
     if series:
+        # Show first 60 cards to keep page fast
+        shown = series[:60]
         cards = "".join(
-            f'<div class="card"><a href="{BASE_URL}/test-series/{item["id"]}" target="_blank">'
+            f'<div class="card"><a href="/series?slug={quote(item["id"], safe="")}">'
             f'<h3>{item["title"]}</h3>'
             f'{f"<p>{item[chr(100)+chr(101)+chr(115)+chr(99)+chr(114)+chr(105)+chr(112)+chr(116)+chr(105)+chr(111)+chr(110)]}</p>" if item.get("description") else ""}'
-            f'<span class="badge">Test Series</span></a></div>'
-            for item in series
+            f'{f"<p>📝 {item[chr(116)+chr(111)+chr(116)+chr(97)+chr(108)+chr(84)+chr(101)+chr(115)+chr(116)+chr(115)]} Tests</p>" if item.get("totalTests") else ""}'
+            f'<span class="badge">Open Series →</span></a></div>'
+            for item in shown
         )
+        note = f'<div class="info-box" style="background:#fef3c7;color:#92400e;">Showing first {len(shown)} of {len(series)} series.</div>' if len(series) > 60 else ""
         body = f"""{greeting}{stats_html}
-        <div class="section-title">📚 Aapki Test Series ({len(series)})</div>
+        <div class="section-title">📚 Test Series ({len(series)})</div>
+        {note}
         <div class="row">{cards}</div>
         {debug_html}"""
     else:
         body = f"""{greeting}{stats_html}
         <div class="empty">
-          <h2>😕 Test series list nahi mili</h2>
-          <p>Aapka token sahi hai (stats aa gaye hain). Bas series ka endpoint nahi mil raha.</p>
-          <p style="margin-top:8px;font-size:12px;">Tried: <b>{endpoint}</b></p>
+          <h2>😕 Series list load nahi hui</h2>
+          <p>Token sahi hai, lekin API se data nahi mila.</p>
           <br>
-          <a href="/debug/probe" class="btn">🔍 50+ Endpoints Probe</a>
+          <a href="/dashboard?debug=1" class="btn">🔍 Debug</a>
         </div>
         {debug_html}"""
     return HTMLResponse(shell("Dashboard", body))
 
-# ---------- Probe ----------
-@app.get("/debug/probe", response_class=HTMLResponse)
-async def probe(session_cookie: Optional[str] = Cookie(None, alias="tb_session")):
+# ---------- Series Page (our own UI) ----------
+@app.get("/series", response_class=HTMLResponse)
+async def series_page(slug: str = Query(...),
+                      debug: int = 0,
+                      session_cookie: Optional[str] = Cookie(None, alias="tb_session")):
     token = get_token(session_cookie)
     if not token:
         return RedirectResponse("/", status_code=302)
 
-    user = get_user_info(token)
-    endpoints = build_endpoints(user["userId"])
+    # Fetch Testbook series page HTML and parse tests
+    url = f"{BASE_URL}/test-series/{slug}"
+    tests, title = [], slug.replace("-", " ").title()
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=25.0) as client:
+            r = await client.get(url, headers=tb_headers(token, json_accept=False))
+        if r.status_code == 200:
+            tests = parse_tests_from_html(r.text)
+            info = parse_series_page(r.text)
+            title = info.get("title") or title
+    except Exception as e:
+        print("series page err:", e)
 
-    lines = []
-    async with httpx.AsyncClient(follow_redirects=True, timeout=8.0) as client:
-        for base_url in endpoints:
-            for auth_style in ("param", "header"):
-                try:
-                    if auth_style == "param":
-                        sep = "&" if "?" in base_url else "?"
-                        full = f"{base_url}{sep}auth_code={quote(token, safe='')}"
-                        r = await client.get(full, headers=tb_headers(token))
-                    else:
-                        r = await client.get(base_url, headers=tb_headers(token))
-                    status = r.status_code
-                    body_snip = r.text[:100].replace("\n"," ")
-                    if status == 200:
-                        try:
-                            j = r.json()
-                            raw: List[dict] = []
-                            _walk(j, raw, _looks_like_series)
-                            mark = f'✅ [200] series={len(raw)}' if raw else '⚠️  [200] no-series'
-                        except Exception:
-                            mark = '⚠️  [200] non-json'
-                    else:
-                        mark = f'❌ [{status}]'
-                    lines.append(f'{mark}  ({auth_style})  {base_url}')
-                    if status != 404:
-                        lines.append(f'      {body_snip}')
-                except Exception as e:
-                    lines.append(f'💥 ERR  ({auth_style})  {base_url}  → {e}')
+    debug_html = ""
+    if debug == 1:
+        debug_html = f'<div class="debug">slug: {slug}\ntests: {len(tests)}\n\n{json.dumps(tests[:5], indent=2, ensure_ascii=False)}</div>'
 
-    body = f"""<a href="/dashboard" class="btn gray" style="margin-bottom:14px;">← Back</a>
-    <div class="info-box">Har endpoint do authentication style se test kiya gaya (param + header).</div>
-    <div class="debug">{chr(10).join(lines)}</div>"""
-    return HTMLResponse(shell("Probe", body))
+    if tests:
+        cards = "".join(
+            f'<div class="card"><a href="/test?slug={quote(t["id"], safe="")}">'
+            f'<h3>{t["title"]}</h3>'
+            f'<span class="badge green">Start Test →</span></a></div>'
+            for t in tests
+        )
+        body = f"""<a href="/dashboard" class="back-btn">← Back</a>
+        <div class="info-box"><b>📚 {title}</b></div>
+        <div class="section-title">📝 Tests ({len(tests)})</div>
+        <div class="row">{cards}</div>
+        {debug_html}"""
+    else:
+        body = f"""<a href="/dashboard" class="back-btn">← Back</a>
+        <div class="info-box"><b>📚 {title}</b></div>
+        <div class="empty">
+          <h2>Is series me tests nahi mile</h2>
+          <p>Link: <code>{url}</code></p>
+          <br>
+          <a href="{url}" target="_blank" class="btn">🔗 Testbook par kholein</a>
+          <a href="/series?slug={quote(slug,safe='')}&debug=1" class="btn gray" style="margin-left:8px;">🔍 Debug</a>
+        </div>
+        {debug_html}"""
+    return HTMLResponse(shell(title, body))
+
+# ---------- Test Page (our own UI) ----------
+@app.get("/test", response_class=HTMLResponse)
+async def test_page(slug: str = Query(...),
+                    debug: int = 0,
+                    session_cookie: Optional[str] = Cookie(None, alias="tb_session")):
+    token = get_token(session_cookie)
+    if not token:
+        return RedirectResponse("/", status_code=302)
+
+    url = f"{BASE_URL}/tests/{slug}"
+    body_html = ""
+    title = slug.replace("-", " ").title()
+
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=25.0) as client:
+            r = await client.get(url, headers=tb_headers(token, json_accept=False))
+        if r.status_code == 200:
+            soup = BeautifulSoup(r.text, "html.parser")
+            if soup.title and soup.title.string:
+                title = soup.title.string.strip()
+            h1 = soup.find("h1")
+            if h1:
+                title = h1.get_text(strip=True)
+            # Extract main visible text
+            for t in soup(["script","style","noscript"]):
+                t.decompose()
+            body_html = soup.get_text("\n", strip=True)[:8000]
+    except Exception as e:
+        print("test page err:", e)
+
+    debug_html = ""
+    if debug == 1:
+        debug_html = f'<div class="debug">slug: {slug}\nlen(text): {len(body_html)}</div>'
+
+    body = f"""<a href="javascript:history.back()" class="back-btn">← Back</a>
+    <div class="info-box"><b>🎯 {title}</b></div>
+    <div class="q-card" style="white-space:pre-wrap;font-size:13px;line-height:1.7;color:#4a5568;">
+      {body_html[:6000] if body_html else "Content load nahi hua."}
+    </div>
+    <div style="text-align:center;margin-top:20px;">
+      <a href="{url}" target="_blank" class="btn green" style="padding:12px 24px;">
+        🎯 Test Start Karein (Testbook par)
+      </a>
+    </div>
+    {debug_html}"""
+
+    return HTMLResponse(shell(title, body))
+
+@app.get("/api/stats")
+async def api_stats(session_cookie: Optional[str] = Cookie(None, alias="tb_session")):
+    token = get_token(session_cookie)
+    if not token:
+        return JSONResponse({"error":"not logged in"}, status_code=401)
+    return {"user": get_user_info(token), "stats": await fetch_stats(token) or {}}
+
+@app.get("/api/series")
+async def api_series(session_cookie: Optional[str] = Cookie(None, alias="tb_session")):
+    token = get_token(session_cookie)
+    if not token:
+        return JSONResponse({"error":"not logged in"}, status_code=401)
+    series = await fetch_series(token)
+    return {"count": len(series), "series": series[:50]}

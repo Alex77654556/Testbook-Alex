@@ -14,18 +14,17 @@ from pydantic import BaseModel
 from typing import List, Optional
 import html as html_lib
 
-app = FastAPI(title="Testbook Live Mirror", version="3.0.0")
+app = FastAPI(title="Testbook Live Mirror", version="3.1.0")
 
 # ---------- Config ----------
 BASE_URL = "https://testbook.com"
 HOME_PATH = "/rrb-group-d/test-series/my"
 TB_PREFIX = "/tb"
-
 SESSION_SECRET = os.getenv("SESSION_SECRET", "testbook-secret-98765")
-UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-      "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+UA = ("Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36")
 
-# ---------- Token / Cookie helpers ----------
+# ---------- Token helpers ----------
 def sign_token(token: str) -> str:
     data = base64.urlsafe_b64encode(token.encode()).decode()
     sig = hmac.new(SESSION_SECRET.encode(), data.encode(), hashlib.sha256).hexdigest()[:16]
@@ -57,7 +56,7 @@ class ScrapeResult(BaseModel):
     count: int
     tests: List[TestInfo]
 
-# ---------- Global error handlers ----------
+# ---------- Error handlers ----------
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     tb = traceback.format_exc()
@@ -102,7 +101,7 @@ font-size:13px;margin-bottom:16px;border:1px solid #fed7d7}
 </style></head><body>
 <div class="card">
 <h1>🔐 Testbook Live Login</h1>
-<p class="sub">Apna Testbook access token daaliye — poori website live mirror hogi.</p>
+<p class="sub">Apna Testbook access token daaliye — poori website live chalegi.</p>
 __ERROR__
 <form method="post" action="/login">
 <label>Access Token</label>
@@ -118,60 +117,143 @@ __ERROR__
 </div>
 </div></body></html>"""
 
-# ---------- HTML Rewriter ----------
-def _rewrite_url(v: str) -> str:
-    if not v:
-        return v
-    if v.startswith("https://testbook.com"):
-        return TB_PREFIX + v[len("https://testbook.com"):]
-    if v.startswith("http://testbook.com"):
-        return TB_PREFIX + v[len("http://testbook.com"):]
-    if v.startswith("//testbook.com"):
-        return TB_PREFIX + v[len("//testbook.com"):]
-    if v.startswith("/") and not v.startswith("//") and not v.startswith(TB_PREFIX + "/"):
-        return TB_PREFIX + v
-    return v
-
-
-INTERCEPTOR_JS = """
+# ---------- The magic interceptor (very aggressive) ----------
+INTERCEPTOR_JS = r"""
 (function(){
   var P = '/tb';
+  var TB = 'testbook.com';
   function fix(u){
     try{
       if(typeof u !== 'string') return u;
-      if(u.indexOf('/tb/') === 0 || u === '/tb') return u;
       if(u.indexOf('https://testbook.com') === 0) return P + u.slice(19);
       if(u.indexOf('http://testbook.com') === 0) return P + u.slice(18);
       if(u.indexOf('//testbook.com') === 0) return P + u.slice(15);
-      if(u.charAt(0) === '/' && u.charAt(1) !== '/') return P + u;
+      if(u.indexOf('https://www.testbook.com') === 0) return P + u.slice(23);
+      if(u.indexOf('//www.testbook.com') === 0) return P + u.slice(19);
+      if(u.charAt(0) === '/' && u.charAt(1) !== '/' && u.indexOf(P+'/') !== 0 && u !== P) return P + u;
       return u;
     }catch(e){ return u; }
   }
-  var _f = window.fetch;
-  if(_f){
-    window.fetch = function(input, init){
-      if(typeof input === 'string'){
-        input = fix(input);
-      } else if(input && input.url){
-        var nu = fix(input.url);
-        if(nu !== input.url){
-          try{ input = new Request(nu, input); }catch(e){}
-        }
+  window.__tbFix = fix;
+
+  // 1) Try to override window.location via delete trick
+  try {
+    var _realLoc = window.location;
+    delete window.location;
+    window.location = new Proxy(_realLoc, {
+      get: function(t, p){
+        if(p === 'href') return _realLoc.href;
+        if(p === 'assign') return function(u){ return _realLoc.assign(fix(u)); };
+        if(p === 'replace') return function(u){ return _realLoc.replace(fix(u)); };
+        var v = _realLoc[p];
+        return typeof v === 'function' ? v.bind(_realLoc) : v;
+      },
+      set: function(t, p, v){
+        if(p === 'href'){ _realLoc.href = fix(v); return true; }
+        _realLoc[p] = v; return true;
       }
-      init = init || {};
-      init.credentials = 'same-origin';
-      return _f.call(this, input, init);
-    };
+    });
+  } catch(e){
+    // fallback: patch assign/replace
+    try { var _a = location.assign; location.assign = function(u){ return _a.call(location, fix(u)); }; } catch(_){}
+    try { var _r = location.replace; location.replace = function(u){ return _r.call(location, fix(u)); }; } catch(_){}
   }
-  var _o = XMLHttpRequest.prototype.open;
-  XMLHttpRequest.prototype.open = function(m, u){
-    var rest = Array.prototype.slice.call(arguments, 2);
-    return _o.apply(this, [m, fix(u)].concat(rest));
+
+  // 2) Patch history
+  try {
+    var _ps = history.pushState, _rs = history.replaceState;
+    history.pushState = function(s,t,u){ return _ps.call(this,s,t, u?fix(u):u); };
+    history.replaceState = function(s,t,u){ return _rs.call(this,s,t, u?fix(u):u); };
+  } catch(e){}
+
+  // 3) Patch window.open
+  try {
+    var _open = window.open;
+    window.open = function(u,n,f){ return _open.call(this, u?fix(u):u, n, f); };
+  } catch(e){}
+
+  // 4) Patch fetch
+  try {
+    var _f = window.fetch;
+    if(_f){
+      window.fetch = function(input, init){
+        try {
+          if(typeof input === 'string') input = fix(input);
+          else if(input && input.url){
+            var nu = fix(input.url);
+            if(nu !== input.url){ try{ input = new Request(nu, input); }catch(e){} }
+          }
+        } catch(e){}
+        init = init || {};
+        try { init.credentials = 'same-origin'; } catch(e){}
+        return _f.call(this, input, init);
+      };
+    }
+  } catch(e){}
+
+  // 5) Patch XHR
+  try {
+    var _o = XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open = function(m,u){
+      var rest = Array.prototype.slice.call(arguments, 2);
+      return _o.apply(this, [m, fix(u)].concat(rest));
+    };
+  } catch(e){}
+
+  // 6) Intercept link clicks
+  document.addEventListener('click', function(e){
+    try {
+      var el = e.target;
+      while(el && el.tagName !== 'A') el = el.parentElement;
+      if(!el) return;
+      var href = el.getAttribute('href');
+      if(!href) return;
+      var fixed = fix(href);
+      if(fixed !== href){
+        e.preventDefault();
+        e.stopPropagation();
+        window.location.href = fixed;
+      }
+    } catch(err){}
+  }, true);
+
+  // 7) Intercept form submissions
+  document.addEventListener('submit', function(e){
+    try {
+      var f = e.target;
+      if(!f || f.tagName !== 'FORM') return;
+      var action = f.getAttribute('action');
+      if(!action) return;
+      var fixed = fix(action);
+      if(fixed !== action) f.setAttribute('action', fixed);
+    } catch(err){}
+  }, true);
+
+  // 8) Catch any script-injected anchors / observers
+  var _setAttr = Element.prototype.setAttribute;
+  Element.prototype.setAttribute = function(name, value){
+    try {
+      if((name === 'href' || name === 'src' || name === 'action') && typeof value === 'string'){
+        value = fix(value);
+      }
+    } catch(e){}
+    return _setAttr.call(this, name, value);
   };
-  // Also hook history.pushState / replaceState so Angular router links work
-  var _ps = history.pushState, _rs = history.replaceState;
-  history.pushState = function(s, t, u){ return _ps.call(this, s, t, u ? fix(u) : u); };
-  history.replaceState = function(s, t, u){ return _rs.call(this, s, t, u ? fix(u) : u); };
+
+  // 9) Also patch HTMLAnchorElement.href setter
+  try {
+    var _desc = Object.getOwnPropertyDescriptor(HTMLAnchorElement.prototype, 'href');
+    if(_desc && _desc.set){
+      Object.defineProperty(HTMLAnchorElement.prototype, 'href', {
+        set: function(v){ _desc.set.call(this, fix(v)); },
+        get: _desc.get,
+        configurable: true
+      });
+    }
+  } catch(e){}
+
+  // 10) Kill location.href writes at the source by observing
+  console.log('[TB-MIRROR] interceptor installed');
 })();
 """
 
@@ -187,13 +269,30 @@ display:flex;gap:6px;font-family:-apple-system,sans-serif;">
 </div>
 """
 
+def _rewrite_url(v: str) -> str:
+    if not v:
+        return v
+    if v.startswith("https://testbook.com"):
+        return TB_PREFIX + v[len("https://testbook.com"):]
+    if v.startswith("http://testbook.com"):
+        return TB_PREFIX + v[len("http://testbook.com"):]
+    if v.startswith("//testbook.com"):
+        return TB_PREFIX + v[len("//testbook.com"):]
+    if v.startswith("https://www.testbook.com"):
+        return TB_PREFIX + v[len("https://www.testbook.com"):]
+    if v.startswith("//www.testbook.com"):
+        return TB_PREFIX + v[len("//www.testbook.com"):]
+    if v.startswith("/") and not v.startswith("//") and not v.startswith(TB_PREFIX + "/"):
+        return TB_PREFIX + v
+    return v
 
 def rewrite_html(html_text: str) -> str:
     soup = BeautifulSoup(html_text, "html.parser")
 
-    # Remove CSP meta (warna humari injected scripts block ho jaayengi)
+    # Remove CSP meta + referrer meta (they can cause issues)
     for meta in soup.find_all("meta"):
-        if meta.get("http-equiv", "").lower() == "content-security-policy":
+        he = (meta.get("http-equiv") or "").lower()
+        if he in ("content-security-policy", "content-security-policy-report-only", "refresh"):
             meta.decompose()
 
     # <base href="/"> → <base href="/tb/">
@@ -208,9 +307,9 @@ def rewrite_html(html_text: str) -> str:
     # Rewrite attributes
     pairs = [
         ("a", "href"), ("link", "href"), ("script", "src"), ("img", "src"),
-        ("source", "src"), ("source", "srcset"), ("iframe", "src"),
-        ("form", "action"), ("video", "src"), ("video", "poster"),
-        ("audio", "src"), ("use", "href"), ("use", "xlink:href"),
+        ("source", "src"), ("iframe", "src"), ("form", "action"),
+        ("video", "src"), ("video", "poster"), ("audio", "src"),
+        ("use", "href"), ("use", "xlink:href"),
         ("image", "href"), ("image", "xlink:href"),
         ("object", "data"), ("embed", "src"), ("track", "src"),
         ("input", "src"), ("area", "href"),
@@ -224,7 +323,7 @@ def rewrite_html(html_text: str) -> str:
                 continue
             el[attr] = _rewrite_url(v)
 
-    # Rewrite srcset (multiple URLs)
+    # srcset
     for el in soup.find_all(attrs={"srcset": True}):
         srcset = el.get("srcset", "")
         parts = []
@@ -238,19 +337,18 @@ def rewrite_html(html_text: str) -> str:
             parts.append(" ".join(sp))
         el["srcset"] = ", ".join(parts)
 
-    # Inject interceptor in head
+    # Inject interceptor at very top of <head> so it runs FIRST
     sc = soup.new_tag("script")
     sc.string = INTERCEPTOR_JS
     if soup.head:
         soup.head.insert(0, sc)
 
-    # Inject floating bar in body
+    # Kill Google Tag Manager meta refresh helpers
     if soup.body:
         bar = BeautifulSoup(FLOATING_BAR, "html.parser")
         soup.body.append(bar)
 
     return str(soup)
-
 
 # ---------- Cookie forwarding ----------
 def _copy_set_cookies(resp, upstream):
@@ -264,17 +362,16 @@ def _copy_set_cookies(resp, upstream):
             pass
     return resp
 
-
-# ---------- Core proxy ----------
-@app.api_route("/tb", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"])
-@app.api_route("/tb/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"])
+# ---------- Proxy ----------
+@app.api_route("/tb", methods=["GET","POST","PUT","PATCH","DELETE","OPTIONS","HEAD"])
+@app.api_route("/tb/{path:path}", methods=["GET","POST","PUT","PATCH","DELETE","OPTIONS","HEAD"])
 async def tb_proxy(request: Request, path: str = "",
-                   session_cookie: Optional[str] = Cookie(None, alias="tb_session")):
-    token = get_token(session_cookie)
+                   session_cookie: Optional[str] = Cookie(None, alias="tb_session"),
+                   tb_token_cookie: Optional[str] = Cookie(None, alias="tb_token")):
+    token = get_token(session_cookie) or tb_token_cookie
     if not token:
         return RedirectResponse("/", status_code=302)
 
-    # Build target URL
     if path:
         target = f"{BASE_URL}/{path}"
     else:
@@ -282,10 +379,8 @@ async def tb_proxy(request: Request, path: str = "",
     if request.url.query:
         target += "?" + request.url.query
 
-    # Forward body
     body = await request.body()
 
-    # Build forwarded headers
     fwd = {
         "Authorization": f"Bearer {token}",
         "User-Agent": UA,
@@ -293,18 +388,18 @@ async def tb_proxy(request: Request, path: str = "",
         "Accept-Language": request.headers.get("accept-language", "en-US,en;q=0.9"),
         "Referer": BASE_URL + "/",
     }
-    for h in ("content-type", "x-requested-with", "x-xsrf-token", "x-csrf-token", "range"):
+    for h in ("content-type", "x-requested-with", "x-xsrf-token", "x-csrf-token", "range", "accept-encoding"):
         if request.headers.get(h):
             fwd[h.title()] = request.headers[h]
+    # Disable br/gzip so we can rewrite HTML cleanly
+    fwd["Accept-Encoding"] = "identity"
 
-    # Forward cookies (except our session)
-    cookie_parts = []
+    cookie_parts = [f"tb_token={token}"]
     for k, v in request.cookies.items():
-        if k == "tb_session":
+        if k in ("tb_session", "tb_token"):
             continue
         cookie_parts.append(f"{k}={v}")
-    if cookie_parts:
-        fwd["Cookie"] = "; ".join(cookie_parts)
+    fwd["Cookie"] = "; ".join(cookie_parts)
 
     try:
         async with httpx.AsyncClient(follow_redirects=False, timeout=30.0) as client:
@@ -318,7 +413,7 @@ async def tb_proxy(request: Request, path: str = "",
             status_code=502,
         )
 
-    # Handle redirects — rewrite Location to /tb/...
+    # Redirects — rewrite Location
     if r.status_code in (301, 302, 303, 307, 308):
         loc = r.headers.get("location", "/")
         if loc.startswith(BASE_URL):
@@ -330,17 +425,18 @@ async def tb_proxy(request: Request, path: str = "",
 
     ctype = r.headers.get("content-type", "").lower()
 
-    # HTML → rewrite
     if "text/html" in ctype:
         try:
-            text = r.text
-            text = rewrite_html(text)
+            text = rewrite_html(r.text)
         except Exception as e:
             text = f"<pre>Rewrite error: {html_lib.escape(str(e))}</pre>"
         resp = HTMLResponse(text, status_code=r.status_code)
+        # Strip frame-blocking headers
+        resp.headers.pop("x-frame-options", None)
+        resp.headers.pop("content-security-policy", None)
+        resp.headers.pop("content-security-policy-report-only", None)
         return _copy_set_cookies(resp, r)
 
-    # Everything else → raw passthrough
     resp = FastResponse(
         content=r.content,
         status_code=r.status_code,
@@ -351,12 +447,10 @@ async def tb_proxy(request: Request, path: str = "",
             resp.headers[h] = r.headers[h]
     return _copy_set_cookies(resp, r)
 
-
 # ---------- Routes ----------
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "testbook-live-mirror"}
-
 
 @app.get("/", response_class=HTMLResponse)
 async def root(error: Optional[str] = None,
@@ -367,7 +461,6 @@ async def root(error: Optional[str] = None,
     if error == "session":
         err_html = '<div class="error">Token expire ho gaya. Dobara login karein.</div>'
     return HTMLResponse(LOGIN_PAGE.replace("__ERROR__", err_html))
-
 
 @app.post("/login")
 async def login(token: str = Form(...)):
@@ -380,7 +473,7 @@ async def login(token: str = Form(...)):
     if token.lower().startswith("bearer "):
         token = token[7:].strip()
 
-    # Validate token against Testbook
+    # Validate
     try:
         async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
             r = await client.get(
@@ -388,7 +481,9 @@ async def login(token: str = Form(...)):
                 headers={
                     "User-Agent": UA,
                     "Authorization": f"Bearer {token}",
+                    "Cookie": f"tb_token={token}",
                     "Accept": "text/html,*/*",
+                    "Accept-Encoding": "identity",
                     "Referer": BASE_URL + "/",
                 },
             )
@@ -411,59 +506,57 @@ async def login(token: str = Form(...)):
         )
 
     resp = RedirectResponse(TB_PREFIX + HOME_PATH, status_code=303)
+    # Our signed session cookie
     resp.set_cookie(
         "tb_session", sign_token(token),
-        httponly=True, samesite="lax",
-        max_age=7 * 24 * 3600, secure=False,
+        httponly=True, samesite="lax", max_age=7*24*3600, secure=False,
+    )
+    # Testbook's own auth cookie so Angular picks up login
+    resp.set_cookie(
+        "tb_token", token,
+        httponly=False, samesite="lax", max_age=7*24*3600, secure=False,
     )
     return resp
-
 
 @app.get("/logout")
 async def logout():
     resp = RedirectResponse("/", status_code=302)
     resp.delete_cookie("tb_session")
+    resp.delete_cookie("tb_token")
     return resp
 
-
-# ---------- JSON API ----------
 @app.get("/api/tests", response_model=ScrapeResult)
 async def api_tests(session_cookie: Optional[str] = Cookie(None, alias="tb_session")):
     token = get_token(session_cookie)
     if not token:
         raise HTTPException(401, "Pehle '/' par jaake login karein.")
-
     async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
         r = await client.get(
             BASE_URL + HOME_PATH,
             headers={
                 "User-Agent": UA,
                 "Authorization": f"Bearer {token}",
+                "Cookie": f"tb_token={token}",
+                "Accept-Encoding": "identity",
                 "Referer": BASE_URL + "/",
             },
         )
     if r.status_code != 200:
         raise HTTPException(r.status_code, f"Testbook fetch failed ({r.status_code})")
-
     soup = BeautifulSoup(r.text, "html.parser")
     tests, seen = [], set()
     for a in soup.select("a[href]"):
         href = a.get("href", "")
         text = a.get_text(" ", strip=True)
-        if not text or len(text) < 3:
-            continue
-        if "/test-series/" not in href and "/tests/" not in href:
-            continue
+        if not text or len(text) < 3: continue
+        if "/test-series/" not in href and "/tests/" not in href: continue
         absolute = href if href.startswith("http") else BASE_URL + href
-        if absolute in seen:
-            continue
+        if absolute in seen: continue
         seen.add(absolute)
         desc = None
         parent = a.find_parent()
         if parent:
             p = parent.find("p")
-            if p:
-                desc = p.get_text(strip=True)
+            if p: desc = p.get_text(strip=True)
         tests.append(TestInfo(title=text, link=absolute, description=desc))
-
     return ScrapeResult(page_url=BASE_URL + HOME_PATH, count=len(tests), tests=tests)

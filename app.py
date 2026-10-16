@@ -13,7 +13,7 @@ from bs4 import BeautifulSoup
 from typing import Optional, List, Dict, Any
 from urllib.parse import quote
 
-app = FastAPI(title="Testbook Mirror", version="13.0.0")
+app = FastAPI(title="Testbook Mirror", version="14.0.0")
 
 BASE_URL = "https://testbook.com"
 API_BASE = "https://api.testbook.com"
@@ -125,28 +125,54 @@ async def fetch_series_list(token: str) -> List[Dict]:
         print("series list error:", e)
         return []
 
-# ---------- Recursive test finder ----------
-def find_all_tests(node: Any, out: List[dict], depth: int = 0):
-    """Find every object that looks like a test."""
-    if depth > 12:
+# ---------- Tests from sections/subsections ----------
+async def fetch_tests_from_subsection(token: str, series_id: str, section_id: str, subsection_id: str) -> List[Dict]:
+    """Try several endpoints to get tests for a subsection."""
+    candidates = [
+        f"{API_BASE}/api/v2_1/test-series/{quote(series_id, safe='')}/section/{quote(section_id, safe='')}/subsection/{quote(subsection_id, safe='')}/tests",
+        f"{API_BASE}/api/v2_1/test-series/{quote(series_id, safe='')}/tests?sectionId={quote(section_id, safe='')}&subsectionId={quote(subsection_id, safe='')}",
+        f"{API_BASE}/api/v2_1/tests?testSeriesId={quote(series_id, safe='')}&sectionId={quote(section_id, safe='')}&subsectionId={quote(subsection_id, safe='')}",
+        f"{API_BASE}/api/v2_1/subsection/{quote(subsection_id, safe='')}/tests",
+    ]
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        for url in candidates:
+            full = f"{url}{'&' if '?' in url else '?'}auth_code={quote(token, safe='')}&language=english"
+            try:
+                r = await client.get(full, headers=tb_headers(token))
+                if r.status_code != 200:
+                    continue
+                j = r.json()
+                if not j.get("success"):
+                    continue
+                raw: List[dict] = []
+                find_tests_loose(j, raw)
+                normalized = normalize_tests(raw)
+                if normalized:
+                    return normalized
+            except Exception:
+                continue
+    return []
+
+def find_tests_loose(node: Any, out: List[dict], depth: int = 0):
+    """Loosely match test objects."""
+    if depth > 10:
         return
     if isinstance(node, list):
         for x in node:
-            find_all_tests(x, out, depth + 1)
+            find_tests_loose(x, out, depth + 1)
     elif isinstance(node, dict):
         keys = set(node.keys())
         has_id = "id" in keys or "_id" in keys
         has_name = "name" in keys or "title" in keys
-        # Common test markers
-        test_markers = {"questionCount", "totalQuestions", "questionsCount", "totalMarks",
-                        "maxMarks", "duration", "totalTime", "testType", "test_type",
-                        "questions", "marks", "time", "totalQuestionsCount",
-                        "testAttempted", "isAttempted", "attempted"}
-        if has_id and has_name and (keys & test_markers):
+        test_hints = keys & {"questionCount", "totalQuestions", "questionsCount",
+                             "duration", "totalTime", "totalMarks", "marks",
+                             "questions", "maxMarks", "time", "totalQuestionsCount",
+                             "testType", "test_type"}
+        if has_id and has_name and test_hints:
             out.append(node)
         for v in node.values():
             if isinstance(v, (list, dict)):
-                find_all_tests(v, out, depth + 1)
+                find_tests_loose(v, out, depth + 1)
 
 def normalize_tests(raw: List[dict]) -> List[Dict]:
     seen, result = set(), []
@@ -167,7 +193,6 @@ def normalize_tests(raw: List[dict]) -> List[Dict]:
         })
     return result
 
-# ---------- Series detail ----------
 async def fetch_series_tests(token: str, series_id: str) -> tuple[List[Dict], Dict, Optional[Dict]]:
     """Return (tests, debug, series_info)."""
     url = f"{API_BASE}/api/v2_1/test-series/{quote(series_id, safe='')}?auth_code={quote(token, safe='')}&language=english"
@@ -186,78 +211,44 @@ async def fetch_series_tests(token: str, series_id: str) -> tuple[List[Dict], Di
             data = j.get("data", {})
             details = data.get("details", {}) if isinstance(data, dict) else {}
 
-            # Dump structure of interesting keys
-            interesting_keys = ["sections", "branches", "stagesFullTests", "menus",
-                                "superSections", "examStages", "studyNotesGroup"]
-            for k in interesting_keys:
-                if k in details:
-                    v = details[k]
-                    if isinstance(v, list):
-                        debug["structure"][k] = f"list len={len(v)}"
-                        if v and isinstance(v[0], dict):
-                            debug["structure"][k + "_first_keys"] = list(v[0].keys())
-                    elif isinstance(v, dict):
-                        debug["structure"][k] = f"dict keys={list(v.keys())[:15]}"
-                    else:
-                        debug["structure"][k] = str(v)[:80]
-
-            # Find all tests anywhere in the response
-            raw_tests: List[dict] = []
-            find_all_tests(details, raw_tests)
-
-            # Also explicitly dig into common paths
-            for path in ("tests", "testList", "test_list"):
-                if isinstance(details.get(path), list):
-                    raw_tests.extend([x for x in details[path] if isinstance(x, dict)])
-
-            # If tests are inside sections/branches/superSections, recursively find
-            for container_key in ("sections", "branches", "superSections", "menus",
-                                  "stagesFullTests", "examStages"):
-                container = details.get(container_key)
-                if container:
-                    find_all_tests(container, raw_tests)
-
-            tests = normalize_tests(raw_tests)
-            debug["tests_found"] = len(tests)
-
+            # Series info
             series_info = {
                 "id": series_id,
                 "title": details.get("name") or "Test Series",
                 "description": details.get("description") or "",
                 "slug": details.get("slug") or "",
             }
+
+            # Extract all tests from sections -> subsections -> tests
+            all_tests: List[Dict] = []
+            sections = details.get("sections", [])
+            debug["sections_count"] = len(sections) if isinstance(sections, list) else 0
+
+            for sec in sections:
+                sec_id = sec.get("id", "")
+                sec_name = sec.get("name", "")
+                subsections = sec.get("subsections", [])
+                for sub in subsections:
+                    sub_id = sub.get("id", "")
+                    sub_name = sub.get("name", "")
+                    # If tests are already inside, use them
+                    inner_tests = sub.get("tests") or []
+                    if isinstance(inner_tests, list) and inner_tests:
+                        for t in inner_tests:
+                            if isinstance(t, dict):
+                                all_tests.append(t)
+                    else:
+                        # Fetch tests from this subsection separately
+                        fetched = await fetch_tests_from_subsection(token, series_id, sec_id, sub_id)
+                        for t in fetched:
+                            all_tests.append(t)
+
+            tests = normalize_tests(all_tests)
+            debug["tests_found"] = len(tests)
             return tests, debug, series_info
     except Exception as e:
         debug["error"] = str(e)
         return [], debug, None
-
-# ---------- Try fetching tests via query ----------
-async def fetch_tests_by_query(token: str, series_id: str) -> tuple[List[Dict], str]:
-    """Some Testbook APIs return tests when filtered."""
-    candidates = [
-        f"{API_BASE}/api/v2_1/tests?testSeriesId={quote(series_id, safe='')}",
-        f"{API_BASE}/api/v2_1/tests?seriesId={quote(series_id, safe='')}",
-        f"{API_BASE}/api/v2/tests?testSeriesId={quote(series_id, safe='')}",
-        f"{API_BASE}/api/v2_1/test-series/{quote(series_id, safe='')}/tests?fetchAll=true",
-    ]
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        for url in candidates:
-            full = f"{url}{'&' if '?' in url else '?'}auth_code={quote(token, safe='')}&language=english"
-            try:
-                r = await client.get(full, headers=tb_headers(token))
-                if r.status_code != 200:
-                    continue
-                j = r.json()
-                if not j.get("success"):
-                    continue
-                raw: List[dict] = []
-                find_all_tests(j, raw)
-                tests = normalize_tests(raw)
-                if tests:
-                    return tests, url
-            except Exception:
-                continue
-    return [], "none"
 
 # ---------- Error handlers ----------
 @app.exception_handler(StarletteHTTPException)
@@ -277,7 +268,7 @@ async def all_exc(request: Request, exc: Exception):
 CSS = """
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
-background:#f0f4f8;color:#1a202c;min-height:100vh;padding-bottom:90px}
+background:#f0f4f8;color:#1a202c;min-height:100vh;padding-bottom:20px}
 .topbar{background:linear-gradient(135deg,#4f46e5,#7c3aed);color:#fff;
 padding:14px 18px;display:flex;align-items:center;justify-content:space-between;
 position:sticky;top:0;z-index:100;box-shadow:0 4px 14px rgba(0,0,0,.15);flex-wrap:wrap;gap:8px}
@@ -285,6 +276,7 @@ position:sticky;top:0;z-index:100;box-shadow:0 4px 14px rgba(0,0,0,.15);flex-wra
 .topbar .nav{display:flex;gap:6px;font-size:12px;flex-wrap:wrap}
 .topbar .nav a{color:#fff;text-decoration:none;padding:6px 12px;
 background:rgba(255,255,255,.18);border-radius:8px;font-weight:600}
+.topbar .nav a:hover{background:rgba(255,255,255,.32)}
 .container{max-width:920px;margin:0 auto;padding:18px}
 .section-title{font-size:14px;font-weight:700;color:#4a5568;margin:8px 0 14px;
 text-transform:uppercase;letter-spacing:.5px}
@@ -307,11 +299,6 @@ cursor:pointer;text-align:center}
 .btn:hover{background:#4338ca}
 .btn.gray{background:#e2e8f0;color:#4a5568}
 .btn.green{background:#10b981;color:#fff}
-.floating{position:fixed;bottom:16px;right:16px;display:flex;gap:8px;z-index:99}
-.floating a{padding:10px 16px;border-radius:26px;text-decoration:none;
-font-size:12px;font-weight:700;color:#fff;box-shadow:0 6px 20px rgba(0,0,0,.25)}
-.floating .home{background:#4f46e5}
-.floating .out{background:#dc2626}
 .info-box{background:#eef2ff;border-radius:12px;padding:14px;margin-bottom:16px;
 font-size:13px;color:#3730a3;line-height:1.7}
 .stat-row{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:14px}
@@ -329,6 +316,7 @@ font-size:13px;font-weight:600}
 """
 
 def shell(title: str, body: str) -> str:
+    # NOTE: Bottom floating buttons REMOVED as requested
     return f"""<!DOCTYPE html><html><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{title} · Testbook Mirror</title><style>{CSS}</style></head><body>
@@ -337,8 +325,6 @@ def shell(title: str, body: str) -> str:
 <a href="/debug/probe">🔍 Debug</a>
 <a href="/logout">Logout</a></div></div>
 <div class="container">{body}</div>
-<div class="floating"><a href="/dashboard" class="home">🏠 Home</a>
-<a href="/logout" class="out">Logout</a></div>
 </body></html>"""
 
 LOGIN_HTML = """<!DOCTYPE html><html><head><meta charset="UTF-8">
@@ -371,7 +357,7 @@ __ERROR__
 
 # ---------- Routes ----------
 @app.get("/health")
-async def health(): return {"status":"ok","version":"13.0.0"}
+async def health(): return {"status":"ok","version":"14.0.0"}
 
 @app.get("/", response_class=HTMLResponse)
 async def root(error: Optional[str] = None,
@@ -455,14 +441,9 @@ async def series_page(id: str = Query(...), slug: str = Query(""),
     tests, dbg, info = await fetch_series_tests(token, id)
     title = (info or {}).get("title") or "Test Series"
 
-    # Fallback: try query endpoint
-    fallback_source = ""
-    if not tests:
-        tests, fallback_source = await fetch_tests_by_query(token, id)
-
     debug_html = ""
     if debug == 1:
-        debug_html = f'<div class="debug">STRUCTURE:\n{json.dumps(dbg.get("structure", {}), indent=2, ensure_ascii=False)}\n\nstatus: {dbg.get("status")}\ntests_found: {dbg.get("tests_found")}\nfallback: {fallback_source}\n\nTESTS:\n{json.dumps(tests[:15], indent=2, ensure_ascii=False)}</div>'
+        debug_html = f'<div class="debug">DBG:\n{json.dumps(dbg, indent=2, ensure_ascii=False)}\n\nTESTS:\n{json.dumps(tests[:15], indent=2, ensure_ascii=False)}</div>'
 
     if tests:
         cards = "".join(
@@ -515,7 +496,7 @@ async def test_page(id: str = Query(...), name: str = Query(""),
     </div>"""
     return HTMLResponse(shell(title, body))
 
-# ---------- Deep debug ----------
+# ---------- Debug probe ----------
 @app.get("/debug/probe", response_class=HTMLResponse)
 async def probe(session_cookie: Optional[str] = Cookie(None, alias="tb_session")):
     token = get_token(session_cookie)
@@ -539,33 +520,22 @@ async def probe(session_cookie: Optional[str] = Cookie(None, alias="tb_session")
                 data = r2.json().get("data", {})
                 details = data.get("details", {})
 
-                # Examine each potentially-test-containing key
-                for key in ["sections", "branches", "superSections", "menus",
-                            "stagesFullTests", "examStages", "studyNotesGroup",
-                            "testSeriesCategory", "faqDetails", "features"]:
-                    if key not in details:
-                        continue
-                    v = details[key]
-                    lines.append(f"\n=== [{key}] type={type(v).__name__} ===")
-                    if isinstance(v, list):
-                        lines.append(f"   len={len(v)}")
-                        if v:
-                            lines.append(f"   first item type={type(v[0]).__name__}")
-                            if isinstance(v[0], dict):
-                                lines.append(f"   first item keys={list(v[0].keys())}")
-                                lines.append(f"   first item sample={json.dumps(v[0], ensure_ascii=False)[:500]}")
-                            elif isinstance(v[0], (str, int)):
-                                lines.append(f"   sample items: {v[:5]}")
-                    elif isinstance(v, dict):
-                        lines.append(f"   keys={list(v.keys())[:20]}")
-                        lines.append(f"   sample={json.dumps(v, ensure_ascii=False)[:400]}")
-                    else:
-                        lines.append(f"   value={str(v)[:200]}")
+                # Dump sections structure
+                sections = details.get("sections", [])
+                lines.append(f"Sections count: {len(sections) if isinstance(sections, list) else 0}")
+                if sections and isinstance(sections, list):
+                    for i, sec in enumerate(sections[:3]):  # first 3 sections
+                        lines.append(f"\n  Section [{i}]: {sec.get('name')} (id: {sec.get('id')})")
+                        subs = sec.get("subsections", [])
+                        lines.append(f"    Subsections: {len(subs)}")
+                        for j2, sub in enumerate(subs[:2]):
+                            lines.append(f"      Sub [{j2}]: {sub.get('name')} (id: {sub.get('id')})")
+                            lines.append(f"        inner tests: {sub.get('tests')}")
     except Exception as e:
         lines.append(f"ERR: {e}")
 
     body = f"""<a href="/dashboard" class="back-btn">← Back</a>
-    <div class="info-box">Har key ka structure</div>
+    <div class="info-box">Sections/Subsections structure</div>
     <div class="debug">{chr(10).join(lines)}</div>"""
     return HTMLResponse(shell("Debug", body))
 

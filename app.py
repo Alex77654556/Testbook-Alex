@@ -15,7 +15,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from typing import Optional, List, Dict, Any
 from urllib.parse import quote
 
-app = FastAPI(title="Testbook Mirror", version="33.0.0")
+app = FastAPI(title="Testbook Mirror", version="35.0.0")
 
 BASE_URL = "https://testbook.com"
 API_BASE = "https://api.testbook.com"
@@ -91,8 +91,8 @@ async def fetch_stats(token: str) -> Optional[dict]:
     except Exception: pass
     return None
 
-async def fetch_series_list(token: str) -> List[Dict]:
-    url = f"{SERIES_LIST_API}?exam=rrb-group-d&auth_code={quote(token, safe='')}&language=english"
+async def fetch_series_list(token: str, exam_slug: str = "rrb-group-d") -> List[Dict]:
+    url = f"{SERIES_LIST_API}?exam={quote(exam_slug, safe='')}&auth_code={quote(token, safe='')}&language=english"
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
             r = await client.get(url, headers=tb_headers(token))
@@ -105,8 +105,9 @@ async def fetch_series_list(token: str) -> List[Dict]:
                 d = item.get("details", {}) if isinstance(item, dict) else {}
                 sid = str(d.get("id") or "")
                 if not sid: continue
-                results.append({"id": sid, "title": str(d.get("name") or "Test Series"),
-                                "description": str(d.get("description") or "")[:200]})
+                results.append({"id": sid, "slug": str(d.get("slug") or ""),
+                                "title": _clean_text(d.get("name") or "Test Series"),
+                                "description": _clean_text(str(d.get("description") or ""))[:200]})
             return results
     except Exception: return []
 
@@ -134,7 +135,7 @@ def normalize_tests(raw):
         tid = str(t.get("id") or t.get("_id") or "")
         if not tid or tid in seen: continue
         seen.add(tid)
-        result.append({"id": tid, "title": str(t.get("title") or t.get("name") or "Test"),
+        result.append({"id": tid, "title": _clean_text(t.get("title") or t.get("name") or "Test"),
                        "questionCount": t.get("questionCount") or 0,
                        "duration": t.get("duration") or 0,
                        "totalMarks": t.get("totalMarks") or t.get("totalMark") or 0,
@@ -154,39 +155,30 @@ async def fetch_all_tests_for_series(token: str, series_id: str) -> List[Dict]:
             return normalize_tests(raw)
     except Exception: return []
 
-# ---------- STRONG cleaner — decode entities + strip HTML ----------
+# ---------- Clean text ----------
 def _clean_text(s: str) -> str:
-    """Decode entities and strip HTML tags cleanly."""
     if s is None: return ""
     s = str(s)
-    # Decode entities multiple times (handles &amp;lt; → &lt; → <)
     for _ in range(4):
         new_s = html_lib.unescape(s)
         if new_s == s: break
         s = new_s
-    # Strip HTML tags using BeautifulSoup
     try:
         soup = BeautifulSoup(s, "html.parser")
         s = soup.get_text()
-    except Exception:
-        pass
-    # Clean whitespace
+    except Exception: pass
     s = s.replace("\u00a0", " ").replace("\t", " ")
-    s = " ".join(s.split())  # collapse multiple spaces
+    s = " ".join(s.split())
     return s.strip()
 
-# ---------- Question parser ----------
+# ---------- Question parser (bilingual) ----------
 def extract_questions_from_test_detail(data: dict) -> List[Dict]:
     questions = []
-    sections = data.get("sections", [])
-    for sec in sections:
+    for sec in data.get("sections", []):
         sec_title = sec.get("title", "")
         for q in sec.get("questions", []):
             if not isinstance(q, dict): continue
             qid = q.get("_id") or q.get("id") or ""
-
-            en = q.get("en") or {}
-            hi = q.get("hi") or {}
 
             def _parse_lang(lang_block):
                 if not isinstance(lang_block, dict): return {"text": "", "options": [], "correctIndex": -1}
@@ -204,13 +196,10 @@ def extract_questions_from_test_detail(data: dict) -> List[Dict]:
                         opts.append(_clean_text(str(o)))
                 return {"text": txt, "options": opts, "correctIndex": ci}
 
-            en_data = _parse_lang(en)
-            hi_data = _parse_lang(hi)
+            en_data = _parse_lang(q.get("en") or {})
+            hi_data = _parse_lang(q.get("hi") or {})
 
-            # Pick English if available, else Hindi
             primary = en_data if en_data["text"] else hi_data
-
-            q_correct = q.get("correctAnswer") or q.get("correct")
 
             questions.append({
                 "id": qid,
@@ -218,14 +207,14 @@ def extract_questions_from_test_detail(data: dict) -> List[Dict]:
                 "type": q.get("type", "mcq"),
                 "text": primary["text"],
                 "options": primary["options"],
-                "text_hi": hi_data["text"],
-                "options_hi": hi_data["options"],
                 "text_en": en_data["text"],
                 "options_en": en_data["options"],
+                "text_hi": hi_data["text"],
+                "options_hi": hi_data["options"],
                 "posMarks": q.get("posMarks", 4),
                 "negMarks": q.get("negMarks", 1),
                 "correctIndex": primary["correctIndex"],
-                "correctAnswer": q_correct,
+                "correctAnswer": q.get("correctAnswer") or q.get("correct"),
             })
     return questions
 
@@ -257,6 +246,20 @@ async def fetch_test_questions(token: str, test_id: str) -> Dict:
         result["error"] = str(e)
         return result
 
+# ---------- Exam list ----------
+EXAM_CATEGORIES = [
+    {"name": "RRB Group D", "slug": "rrb-group-d"},
+    {"name": "RRB NTPC", "slug": "rrb-ntpc"},
+    {"name": "SSC CGL", "slug": "ssc-cgl"},
+    {"name": "SSC GD", "slug": "ssc-gd"},
+    {"name": "Bihar Police SI", "slug": "bihar-police-si"},
+    {"name": "UP Police", "slug": "up-police"},
+    {"name": "IBPS PO", "slug": "ibps-po"},
+    {"name": "SBI PO", "slug": "sbi-po"},
+    {"name": "CTET", "slug": "ctet"},
+    {"name": "UGC NET", "slug": "ugc-net"},
+]
+
 # ---------- Error handlers ----------
 @app.exception_handler(StarletteHTTPException)
 async def http_exc(request: Request, exc: StarletteHTTPException):
@@ -283,6 +286,7 @@ position:sticky;top:0;z-index:100;box-shadow:0 4px 14px rgba(0,0,0,.15);flex-wra
 .topbar .nav{display:flex;gap:6px;font-size:12px;flex-wrap:wrap}
 .topbar .nav a{color:#fff;text-decoration:none;padding:6px 12px;
 background:rgba(255,255,255,.18);border-radius:8px;font-weight:600}
+.topbar .nav a:hover{background:rgba(255,255,255,.32)}
 .container{max-width:920px;margin:0 auto;padding:18px}
 .section-title{font-size:14px;font-weight:700;color:#4a5568;margin:8px 0 14px;
 text-transform:uppercase;letter-spacing:.5px}
@@ -323,7 +327,24 @@ border-top-color:#4f46e5;border-radius:50%;animation:spin .8s linear infinite}
 .loading-box{text-align:center;padding:50px 20px}
 .loading-box p{margin-top:16px;color:#718096;font-size:14px}
 
-/* ===== TESTBOOK-STYLE QUIZ UI ===== */
+/* Exam grid */
+.exam-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:10px;margin-top:14px}
+.exam-item{background:#fff;border-radius:12px;padding:14px;text-align:center;
+box-shadow:0 2px 8px rgba(0,0,0,.05);text-decoration:none;color:#1a202c;
+transition:transform .15s;border:2px solid transparent}
+.exam-item:hover{transform:translateY(-2px);border-color:#4f46e5}
+.exam-item .icon{font-size:28px;margin-bottom:8px}
+.exam-item .name{font-size:13px;font-weight:600}
+
+/* Search box */
+.search-box{display:flex;gap:8px;margin-bottom:18px}
+.search-box input{flex:1;padding:12px 16px;border:1.5px solid #e2e8f0;border-radius:10px;
+font-size:14px;outline:none}
+.search-box input:focus{border-color:#4f46e5}
+.search-box button{padding:12px 20px;background:#4f46e5;color:#fff;border:none;
+border-radius:10px;font-weight:600;cursor:pointer}
+
+/* Quiz UI */
 .tb-header{background:#fff;padding:12px 16px;position:sticky;top:56px;z-index:40;
 border-bottom:1px solid #e2e8f0;display:flex;align-items:center;gap:12px;flex-wrap:wrap}
 .tb-header .q-num-big{font-size:24px;font-weight:800;color:#1a202c;min-width:36px}
@@ -337,8 +358,6 @@ border-bottom:1px solid #e2e8f0;display:flex;align-items:center;gap:12px;flex-wr
 font-family:monospace;font-size:14px;font-weight:700;letter-spacing:1px}
 .tb-header .lang-select{padding:6px 12px;border:1.5px solid #e2e8f0;border-radius:8px;
 font-size:13px;font-weight:600;color:#4a5568;background:#fff;cursor:pointer;outline:none}
-.tb-header .lang-select:focus{border-color:#4f46e5}
-
 .tb-question{padding:20px 16px;background:#fff}
 .tb-question .q-text{font-size:16px;line-height:1.7;color:#1a202c;margin-bottom:20px;word-break:break-word;white-space:pre-wrap}
 .tb-opt{display:flex;align-items:flex-start;gap:12px;padding:14px 16px;
@@ -355,27 +374,23 @@ border-radius:50%;display:flex;align-items:center;justify-content:center;margin-
 .tb-opt.correct .radio{border-color:#10b981;background:#10b981}
 .tb-opt.wrong .radio{border-color:#ef4444;background:#ef4444}
 .tb-opt .opt-text{flex:1;word-break:break-word}
-
 .tb-nav{background:#fff;padding:12px 16px;display:flex;gap:10px;flex-wrap:wrap;
 border-top:1px solid #e2e8f0;position:sticky;bottom:0;z-index:40;
 box-shadow:0 -2px 10px rgba(0,0,0,.05)}
 .tb-nav button{flex:1;min-width:100px;padding:12px;border:none;border-radius:8px;
-font-size:14px;font-weight:700;cursor:pointer;transition:all .15s}
+font-size:14px;font-weight:700;cursor:pointer}
 .btn-mark{background:#e2e8f0;color:#4a5568}
 .btn-clear{background:#e2e8f0;color:#4a5568}
 .btn-save{background:#1fbad6;color:#fff}
-.btn-save:hover{background:#1899b0}
 .btn-prev{background:#e2e8f0;color:#4a5568}
 .btn-next{background:#1fbad6;color:#fff}
-
+.btn-submit{background:#10b981;color:#fff}
 .progress-bar{height:3px;background:#e2e8f0;position:sticky;top:104px;z-index:39}
 .progress-bar .fill{height:100%;background:linear-gradient(90deg,#4f46e5,#7c3aed);transition:width .2s}
-
 .result-box{background:linear-gradient(135deg,#4f46e5,#7c3aed);color:#fff;
 padding:24px;border-radius:14px;text-align:center;margin:16px}
 .result-box .score{font-size:42px;font-weight:900;margin:8px 0}
 .result-box .lbl{font-size:13px;opacity:.9}
-
 .q-indicator{display:inline-flex;align-items:center;justify-content:center;
 width:28px;height:28px;border-radius:6px;background:#e2e8f0;color:#4a5568;
 font-size:11px;font-weight:700;margin:2px;cursor:pointer}
@@ -391,7 +406,9 @@ def shell(title: str, body: str) -> str:
 <title>{title} · Testbook Mirror</title><style>{CSS}</style></head><body>
 <div class="topbar"><h1>📚 Testbook Mirror</h1>
 <div class="nav"><a href="/dashboard">🏠 Home</a>
-<a href="/debug/probe">🔍 Debug</a>
+<a href="/online-test-series">📝 Series</a>
+<a href="/search">🔍 Search</a>
+<a href="/debug/probe">🐛 Debug</a>
 <a href="/logout">Logout</a></div></div>
 {body}
 </body></html>"""
@@ -426,7 +443,7 @@ __ERROR__
 
 # ---------- Routes ----------
 @app.get("/health")
-async def health(): return {"status":"ok","version":"33.0.0"}
+async def health(): return {"status":"ok","version":"35.0.0"}
 
 @app.get("/", response_class=HTMLResponse)
 async def root(error: Optional[str] = None,
@@ -458,13 +475,13 @@ async def logout():
     resp.delete_cookie("tb_session")
     return resp
 
+# ---------- DASHBOARD (Home) ----------
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard(session_cookie: Optional[str] = Cookie(None, alias="tb_session")):
     token = get_token(session_cookie)
     if not token: return RedirectResponse("/", status_code=302)
     user = get_user_info(token)
     stats = await fetch_stats(token)
-    series = await fetch_series_list(token)
 
     stats_html = ""
     if stats:
@@ -476,23 +493,127 @@ async def dashboard(session_cookie: Optional[str] = Cookie(None, alias="tb_sessi
     paid_badge = " 💎" if user.get("isPaid") else ""
     greeting = f'<div class="info-box">✅ <b>Welcome, {user["name"]}{paid_badge}!</b><br>{user["email"]}</div>'
 
-    if series:
-        cards = "".join(
-            f'<div class="card"><a href="/series?id={quote(item["id"], safe="")}">'
-            f'<h3>{item["title"]}</h3>'
-            f'{f"<p>{item[chr(100)+chr(101)+chr(115)+chr(99)+chr(114)+chr(105)+chr(112)+chr(116)+chr(105)+chr(111)+chr(110)][:140]}...</p>" if item.get("description") else ""}'
-            f'<span class="badge">Open Series →</span></a></div>'
-            for item in series
-        )
-        body = f"""<div class="container">{greeting}{stats_html}
-        <div class="section-title">📚 Test Series ({len(series)})</div>
-        <div class="row">{cards}</div></div>"""
-    else:
-        body = f"""<div class="container">{greeting}{stats_html}
-        <div class="empty"><h2>😕 Series list load nahi hui</h2>
-        <a href="/debug/probe" class="btn">🔍 Debug</a></div></div>"""
+    # Exam quick links
+    exam_html = ""
+    for ex in EXAM_CATEGORIES[:8]:
+        exam_html += f'<a href="/exam/{ex["slug"]}" class="exam-item">' \
+                     f'<div class="icon">📖</div>' \
+                     f'<div class="name">{ex["name"]}</div></a>'
+
+    body = f"""<div class="container">
+    {greeting}
+    {stats_html}
+    <div class="section-title">🎯 Popular Exams</div>
+    <div class="exam-grid">{exam_html}</div>
+    <div class="section-title" style="margin-top:24px;">🔗 Quick Links</div>
+    <div class="row">
+      <div class="card"><a href="/online-test-series"><h3>📝 All Test Series</h3><p>Saari test series ek jagah</p></a></div>
+      <div class="card"><a href="/search"><h3>🔍 Search</h3><p>Exam ya test dhundhein</p></a></div>
+      <div class="card"><a href="/exam/bihar-police-si"><h3>👮 Bihar Police SI</h3><p>Current exam series</p></a></div>
+    </div>
+    </div>"""
     return HTMLResponse(shell("Dashboard", body))
 
+# ---------- ONLINE TEST SERIES ----------
+@app.get("/online-test-series", response_class=HTMLResponse)
+async def online_test_series(session_cookie: Optional[str] = Cookie(None, alias="tb_session")):
+    token = get_token(session_cookie)
+    if not token: return RedirectResponse("/", status_code=302)
+
+    all_series = []
+    for ex in EXAM_CATEGORIES[:5]:
+        s = await fetch_series_list(token, ex["slug"])
+        for item in s:
+            item["exam"] = ex["name"]
+        all_series.extend(s)
+
+    cards = "".join(
+        f'<div class="card"><a href="/series?id={quote(item["id"], safe="")}">'
+        f'<h3>{item["title"]}</h3>'
+        f'<p>📖 {item.get("exam","")}</p>'
+        f'<span class="badge">Open →</span></a></div>'
+        for item in all_series
+    )
+
+    body = f"""<div class="container">
+    <a href="/dashboard" class="back-btn">← Back</a>
+    <div class="info-box"><b>📝 Online Test Series ({len(all_series)})</b></div>
+    <div class="row">{cards if cards else '<div class="empty"><h2>Series load nahi hui</h2></div>'}</div>
+    </div>"""
+    return HTMLResponse(shell("Test Series", body))
+
+# ---------- EXAM PAGE ----------
+@app.get("/exam/{slug}", response_class=HTMLResponse)
+async def exam_page(slug: str, session_cookie: Optional[str] = Cookie(None, alias="tb_session")):
+    token = get_token(session_cookie)
+    if not token: return RedirectResponse("/", status_code=302)
+
+    series = await fetch_series_list(token, slug)
+    title = next((e["name"] for e in EXAM_CATEGORIES if e["slug"] == slug), slug.title())
+
+    cards = "".join(
+        f'<div class="card"><a href="/series?id={quote(item["id"], safe="")}">'
+        f'<h3>{item["title"]}</h3>'
+        f'{f"<p>{item.get("description","")[:120]}...</p>" if item.get("description") else ""}'
+        f'<span class="badge">Open Series →</span></a></div>'
+        for item in series
+    )
+
+    body = f"""<div class="container">
+    <a href="/dashboard" class="back-btn">← Back</a>
+    <div class="info-box"><b>📖 {title}</b><br>{len(series)} test series</div>
+    <div class="row">{cards if cards else '<div class="empty"><h2>Is exam ke liye series nahi mili</h2></div>'}</div>
+    </div>"""
+    return HTMLResponse(shell(title, body))
+
+# ---------- SEARCH ----------
+@app.get("/search", response_class=HTMLResponse)
+async def search_page(q: str = Query(""), session_cookie: Optional[str] = Cookie(None, alias="tb_session")):
+    token = get_token(session_cookie)
+    if not token: return RedirectResponse("/", status_code=302)
+
+    results = []
+    if q:
+        # Search across our known exams
+        q_lower = q.lower()
+        for ex in EXAM_CATEGORIES:
+            if q_lower in ex["name"].lower() or q_lower in ex["slug"].lower():
+                results.append({"title": ex["name"], "link": f'/exam/{ex["slug"]}', "type": "Exam"})
+        # Also search test series in top exams
+        for ex in EXAM_CATEGORIES[:3]:
+            series = await fetch_series_list(token, ex["slug"])
+            for s in series:
+                if q_lower in s["title"].lower():
+                    results.append({"title": s["title"], "link": f'/series?id={quote(s["id"], safe="")}',
+                                    "type": f'Series ({ex["name"]})'})
+        # Dedupe
+        seen = set()
+        uniq = []
+        for r in results:
+            if r["title"] not in seen:
+                seen.add(r["title"])
+                uniq.append(r)
+        results = uniq
+
+    cards = "".join(
+        f'<div class="card"><a href="{r["link"]}"><h3>{r["title"]}</h3>'
+        f'<span class="badge">{r["type"]}</span></a></div>'
+        for r in results
+    )
+
+    body = f"""<div class="container">
+    <a href="/dashboard" class="back-btn">← Back</a>
+    <div class="info-box"><b>🔍 Search</b></div>
+    <form class="search-box" method="get" action="/search">
+      <input type="text" name="q" value="{q}" placeholder="Exam ya test series dhundhein..." autofocus>
+      <button type="submit">Search</button>
+    </form>
+    {f'<div class="section-title">{len(results)} results found</div>' if q else ''}
+    <div class="row">{cards}</div>
+    </div>"""
+    return HTMLResponse(shell("Search", body))
+
+# ---------- SERIES PAGE ----------
 @app.get("/series", response_class=HTMLResponse)
 async def series_page(id: str = Query(...),
                       session_cookie: Optional[str] = Cookie(None, alias="tb_session")):
@@ -553,7 +674,7 @@ async def api_series_tests(id: str = Query(...),
     except Exception as e:
         return {"tests": [], "error": str(e)}
 
-# ---------- TEST PAGE — Testbook-style quiz UI ----------
+# ---------- TEST PAGE (quiz) ----------
 @app.get("/test", response_class=HTMLResponse)
 async def test_page(id: str = Query(...), name: str = Query(""),
                     session_cookie: Optional[str] = Cookie(None, alias="tb_session")):
@@ -575,7 +696,7 @@ async def test_page(id: str = Query(...), name: str = Query(""),
           const box = document.getElementById('quiz');
           if (!data.questions || data.questions.length === 0) {{
             box.innerHTML = '<div class="empty"><h2>😕 Questions load nahi ho paye</h2>' +
-              '<p>' + (data.error || 'Question data API se nahi mila') + '</p>' +
+              '<p>' + (data.error || '') + '</p>' +
               '<a href="/debug/probe" class="btn" style="margin-top:12px;">🔍 Debug</a></div>';
             return;
           }}
@@ -593,15 +714,12 @@ async def test_page(id: str = Query(...), name: str = Query(""),
 
         const totalQs = questions.length;
 
-        // Outer container
         let html = '<div class="container" style="padding:0;max-width:100%">';
-
-        // TOP HEADER (Testbook style)
         html += '<div class="tb-header">' +
           '<span class="q-num-big" id="qNum">1.</span>' +
           '<div class="q-stats">' +
           '<div class="q-stat"><span class="lbl">Marks</span>' +
-          '<span class="val"><span class="marks-pos">+' + (questions[0].posMarks || 4) + '</span> / ' +
+          '<span class="val" id="qMarks"><span class="marks-pos">+' + (questions[0].posMarks || 4) + '</span> / ' +
           '<span class="marks-neg">-' + (questions[0].negMarks || 1) + '</span></span></div>' +
           '<div class="q-stat"><span class="lbl">Time</span>' +
           '<span class="val" id="qTime">00:00</span></div>' +
@@ -612,25 +730,16 @@ async def test_page(id: str = Query(...), name: str = Query(""),
           '<option value="hi">हिंदी</option>' +
           '</select>' +
           '</div>';
-
-        // Progress bar
         html += '<div class="progress-bar"><div class="fill" id="progressFill" style="width:0%"></div></div>';
-
-        // Question indicators
         html += '<div class="q-indicators" id="indicators"></div>';
-
-        // Question area
         html += '<div class="tb-question" id="questionArea"></div>';
-
-        // Bottom nav
         html += '<div class="tb-nav">' +
           '<button class="btn-mark" onclick="markForReview()">Mark for Review</button>' +
           '<button class="btn-clear" onclick="clearResponse()">Clear</button>' +
           '<button class="btn-prev" onclick="prevQuestion()">← Prev</button>' +
           '<button class="btn-save" onclick="saveAndNext()">Save & Next →</button>' +
-          '<button class="btn-next" style="background:#10b981" onclick="submitQuiz()">Submit</button>' +
+          '<button class="btn-submit" onclick="submitQuiz()">Submit</button>' +
           '</div>';
-
         html += '</div>';
         document.getElementById('quiz').innerHTML = html;
 
@@ -641,13 +750,13 @@ async def test_page(id: str = Query(...), name: str = Query(""),
       function renderCurrentQuestion() {{
         const q = window.__questions[window.__current];
         const lang = window.__lang;
-        const qText = lang === 'hi' && q.text_hi ? q.text_hi : (lang === 'en' && q.text_en ? q.text_en : q.text);
-        const qOpts = lang === 'hi' && q.options_hi && q.options_hi.length ? q.options_hi :
-                     (lang === 'en' && q.options_en && q.options_en.length ? q.options_en : q.options);
+        const qText = (lang === 'hi' && q.text_hi) ? q.text_hi : (q.text_en || q.text);
+        const qOpts = (lang === 'hi' && q.options_hi && q.options_hi.length) ? q.options_hi : (q.options_en || q.options);
 
         document.getElementById('qNum').textContent = (window.__current + 1) + '.';
-        document.querySelector('.tb-header .marks-pos').textContent = '+' + (q.posMarks || 4);
-        document.querySelector('.tb-header .marks-neg').textContent = '-' + (q.negMarks || 1);
+        document.getElementById('qMarks').innerHTML =
+          '<span class="marks-pos">+' + (q.posMarks || 4) + '</span> / ' +
+          '<span class="marks-neg">-' + (q.negMarks || 1) + '</span>';
 
         let html = '<div class="q-text">' + escapeHtml(qText) + '</div>';
         qOpts.forEach((opt, j) => {{
@@ -657,7 +766,6 @@ async def test_page(id: str = Query(...), name: str = Query(""),
             '<div class="opt-text">' + escapeHtml(opt) + '</div></div>';
         }});
         document.getElementById('questionArea').innerHTML = html;
-
         renderIndicators();
         updateProgress();
       }}
@@ -680,108 +788,60 @@ async def test_page(id: str = Query(...), name: str = Query(""),
         updateProgress();
       }}
 
-      function clearResponse() {{
-        delete window.__answers[window.__current];
-        renderCurrentQuestion();
-      }}
-
-      function markForReview() {{
-        window.__marked[window.__current] = !window.__marked[window.__current];
-        alert(window.__marked[window.__current] ? 'Marked for review' : 'Unmarked');
-      }}
-
-      function saveAndNext() {{
-        if (window.__current < window.__questions.length - 1) {{
-          window.__current++;
-          renderCurrentQuestion();
-          window.scrollTo({{ top: 0, behavior: 'smooth' }});
-        }} else {{
-          alert('Yeh last question hai. Submit dabayein.');
-        }}
-      }}
-
-      function prevQuestion() {{
-        if (window.__current > 0) {{
-          window.__current--;
-          renderCurrentQuestion();
-          window.scrollTo({{ top: 0, behavior: 'smooth' }});
-        }}
-      }}
-
-      function jumpTo(i) {{
-        window.__current = i;
-        renderCurrentQuestion();
-        window.scrollTo({{ top: 0, behavior: 'smooth' }});
-      }}
-
-      function switchLang(l) {{
-        window.__lang = l;
-        renderCurrentQuestion();
-      }}
+      function clearResponse() {{ delete window.__answers[window.__current]; renderCurrentQuestion(); }}
+      function markForReview() {{ window.__marked[window.__current] = !window.__marked[window.__current];
+        alert(window.__marked[window.__current] ? 'Marked for review' : 'Unmarked'); }}
+      function saveAndNext() {{ if (window.__current < window.__questions.length - 1) {{ window.__current++; renderCurrentQuestion(); window.scrollTo({{top:0,behavior:'smooth'}}); }} }}
+      function prevQuestion() {{ if (window.__current > 0) {{ window.__current--; renderCurrentQuestion(); window.scrollTo({{top:0,behavior:'smooth'}}); }} }}
+      function jumpTo(i) {{ window.__current = i; renderCurrentQuestion(); window.scrollTo({{top:0,behavior:'smooth'}}); }}
+      function switchLang(l) {{ window.__lang = l; renderCurrentQuestion(); }}
 
       function updateProgress() {{
         const total = window.__questions.length;
         const ans = Object.keys(window.__answers).length;
-        const pct = (ans / total) * 100;
-        document.getElementById('progressFill').style.width = pct + '%';
+        document.getElementById('progressFill').style.width = (ans / total) * 100 + '%';
       }}
 
       function startTimer() {{
         if (window.__timerInterval) clearInterval(window.__timerInterval);
         updateTimerDisplay();
         window.__timerInterval = setInterval(() => {{
-          if (window.__timeLeft <= 0) {{
-            clearInterval(window.__timerInterval);
-            alert('Time up! Auto-submitting...');
-            submitQuiz();
-            return;
-          }}
-          window.__timeLeft--;
-          updateTimerDisplay();
+          if (window.__timeLeft <= 0) {{ clearInterval(window.__timerInterval); submitQuiz(); return; }}
+          window.__timeLeft--; updateTimerDisplay();
         }}, 1000);
       }}
 
       function updateTimerDisplay() {{
         const t = window.__timeLeft;
-        const h = Math.floor(t / 3600);
-        const m = Math.floor((t % 3600) / 60);
-        const s = t % 60;
+        const h = Math.floor(t / 3600), m = Math.floor((t % 3600) / 60), s = t % 60;
         const pad = (n) => String(n).padStart(2, '0');
         document.getElementById('mainTimer').textContent =
           (h > 0 ? pad(h) + ':' : '') + pad(m) + ':' + pad(s);
       }}
 
       function submitQuiz() {{
-        if (!confirm('Submit karein? Attempted: ' + Object.keys(window.__answers).length + '/' + window.__questions.length)) return;
+        if (!confirm('Submit karein?')) return;
         if (window.__timerInterval) clearInterval(window.__timerInterval);
         const answers = window.__answers || {{}}, questions = window.__questions || [];
         let attempted = Object.keys(answers).length;
         let correct = 0, wrong = 0, scoreable = 0;
-
         questions.forEach((q, i) => {{
           let ci = q.correctIndex;
           if (ci === undefined || ci < 0) ci = -1;
-          if (ci >= 0) {{
-            scoreable++;
-            if (answers[i] === ci) correct++;
-            else if (answers[i] !== undefined) wrong++;
-          }}
+          if (ci >= 0) {{ scoreable++; if (answers[i] === ci) correct++; else if (answers[i] !== undefined) wrong++; }}
         }});
-
         const rb = document.createElement('div');
         rb.className = 'result-box';
-
         if (scoreable === 0) {{
           rb.innerHTML = '<div class="lbl">Test Submitted ✅</div>' +
             '<div class="score">' + attempted + ' / ' + questions.length + '</div>' +
             '<div class="lbl">Attempted · Live test me correct answers hidden hote hain</div>' +
             '<button class="btn" style="background:#fff;color:#4f46e5;margin-top:16px;" onclick="window.location.reload()">🔄 Retake</button>';
         }} else {{
-          const totalMarks = (correct * 4) - (wrong * 1);
           rb.innerHTML = '<div class="lbl">Your Score</div>' +
             '<div class="score">' + correct + ' / ' + questions.length + '</div>' +
             '<div class="lbl">Attempted: ' + attempted + ' · Correct: ' + correct + ' · Wrong: ' + wrong + '</div>' +
-            '<div class="lbl" style="margin-top:8px;">Approx Marks: ' + totalMarks + '</div>' +
+            '<div class="lbl" style="margin-top:8px;">Approx Marks: ' + ((correct*4) - (wrong*1)) + '</div>' +
             '<button class="btn" style="background:#fff;color:#4f46e5;margin-top:16px;" onclick="window.location.reload()">🔄 Retake</button>';
         }}
         document.getElementById('quiz').innerHTML = '';
@@ -791,9 +851,7 @@ async def test_page(id: str = Query(...), name: str = Query(""),
 
       function escapeHtml(s) {{
         if (s == null) return '';
-        return String(s).replace(/[&<>"']/g, c => ({{
-          '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
-        }}[c]));
+        return String(s).replace(/[&<>"']/g, c => ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]));
       }}
     </script>"""
     return HTMLResponse(shell(title, body))
@@ -805,12 +863,8 @@ async def api_test_questions(id: str = Query(...),
     if not token: return JSONResponse({"error": "not logged in", "questions": []}, status_code=401)
     try:
         result = await asyncio.wait_for(fetch_test_questions(token, id), timeout=25.0)
-        return {
-            "questions": result["questions"],
-            "count": len(result["questions"]),
-            "test_info": result.get("test_info"),
-            "error": result.get("error"),
-        }
+        return {"questions": result["questions"], "count": len(result["questions"]),
+                "test_info": result.get("test_info"), "error": result.get("error")}
     except Exception as e:
         return {"questions": [], "error": str(e)}
 
@@ -819,38 +873,35 @@ async def api_test_questions(id: str = Query(...),
 async def probe(session_cookie: Optional[str] = Cookie(None, alias="tb_session")):
     token = get_token(session_cookie)
     if not token: return RedirectResponse("/", status_code=302)
-
     user = get_user_info(token)
     lines = [f"User: {user.get('name')} | isPaidUser: {user.get('isPaid')}", ""]
-
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
-            r = await client.get(f"{SERIES_LIST_API}?exam=rrb-group-d&auth_code={quote(token,safe='')}", headers=tb_headers(token))
+            r = await client.get(f"{SERIES_LIST_API}?exam=bihar-police-si&auth_code={quote(token,safe='')}", headers=tb_headers(token))
             ts = r.json().get("data", {}).get("testSeries", [])
+            lines.append(f"Series in bihar-police-si: {len(ts)}")
             if ts:
                 sid = ts[0]["details"]["id"]
+                lines.append(f"First: {ts[0]['details']['name']}")
+                lines.append(f"ID: {sid}")
                 all_url = f"{ALL_API}?tsid={quote(sid, safe='')}&auth_code={quote(token, safe='')}&language=english"
                 rr = await client.get(all_url, headers=tb_headers(token))
                 data = rr.json().get("data", {})
                 live = data.get("liveTests", [])
                 if live:
                     test_id = live[0]["id"]
-                    lines.append(f"Test: {live[0]['title']}")
+                    lines.append(f"\nTest: {live[0]['title']}")
                     lines.append(f"ID: {test_id}")
-                    lines.append("")
-
                     result = await fetch_test_questions(token, test_id)
-                    lines.append(f"=== PARSED RESULT ===")
-                    lines.append(f"Test info: {json.dumps(result.get('test_info'), ensure_ascii=False)}")
-                    lines.append(f"Questions found: {len(result['questions'])}")
-                    lines.append("")
+                    lines.append(f"Questions: {len(result['questions'])}")
                     if result["questions"]:
-                        lines.append("=== FIRST QUESTION (cleaned) ===")
-                        lines.append(json.dumps(result["questions"][0], ensure_ascii=False, indent=2)[:900])
+                        q = result["questions"][0]
+                        lines.append(f"\nSample Q: {q['text'][:100]}")
+                        lines.append(f"Options: {len(q['options'])}")
+                        lines.append(f"Hindi text: {'YES' if q.get('text_hi') else 'NO'}")
     except Exception as e:
         lines.append(f"ERR: {e}")
-
     body = f"""<div class="container"><a href="/dashboard" class="back-btn">← Back</a>
-    <div class="info-box">✅ Cleaned questions + Testbook-style quiz UI</div>
+    <div class="info-box">Debug output</div>
     <div class="debug">{chr(10).join(lines)}</div></div>"""
     return HTMLResponse(shell("Debug", body))

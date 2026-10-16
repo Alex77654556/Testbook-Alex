@@ -8,13 +8,14 @@ import hashlib
 import asyncio
 import httpx
 import html as html_lib
+from bs4 import BeautifulSoup
 from fastapi import FastAPI, Form, Cookie, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from typing import Optional, List, Dict, Any
 from urllib.parse import quote
 
-app = FastAPI(title="Testbook Mirror", version="32.0.0")
+app = FastAPI(title="Testbook Mirror", version="33.0.0")
 
 BASE_URL = "https://testbook.com"
 API_BASE = "https://api.testbook.com"
@@ -153,21 +154,26 @@ async def fetch_all_tests_for_series(token: str, series_id: str) -> List[Dict]:
             return normalize_tests(raw)
     except Exception: return []
 
-# ---------- Question text cleaner ----------
-def _clean(s: str) -> str:
-    """Decode HTML entities and clean question text."""
-    if not s:
-        return ""
+# ---------- STRONG cleaner — decode entities + strip HTML ----------
+def _clean_text(s: str) -> str:
+    """Decode entities and strip HTML tags cleanly."""
+    if s is None: return ""
     s = str(s)
-    # Decode HTML entities multiple times (&amp;nbsp; → &nbsp; → space)
-    for _ in range(3):
+    # Decode entities multiple times (handles &amp;lt; → &lt; → <)
+    for _ in range(4):
         new_s = html_lib.unescape(s)
-        if new_s == s:
-            break
+        if new_s == s: break
         s = new_s
-    s = s.replace("\u00a0", " ").replace("&nbsp;", " ")
-    s = s.strip()
-    return s
+    # Strip HTML tags using BeautifulSoup
+    try:
+        soup = BeautifulSoup(s, "html.parser")
+        s = soup.get_text()
+    except Exception:
+        pass
+    # Clean whitespace
+    s = s.replace("\u00a0", " ").replace("\t", " ")
+    s = " ".join(s.split())  # collapse multiple spaces
+    return s.strip()
 
 # ---------- Question parser ----------
 def extract_questions_from_test_detail(data: dict) -> List[Dict]:
@@ -179,22 +185,30 @@ def extract_questions_from_test_detail(data: dict) -> List[Dict]:
             if not isinstance(q, dict): continue
             qid = q.get("_id") or q.get("id") or ""
 
-            # Prefer English, fallback Hindi
-            en = q.get("en") or q.get("hi") or {}
-            if not isinstance(en, dict): en = {}
-            text = _clean(en.get("value") or en.get("questionText") or "")
+            en = q.get("en") or {}
+            hi = q.get("hi") or {}
 
-            opts_raw = en.get("options") or []
-            options = []
-            correct_idx = -1
-            for i, o in enumerate(opts_raw):
-                if isinstance(o, dict):
-                    opt_text = _clean(o.get("value") or o.get("text") or "")
-                    options.append(opt_text)
-                    if o.get("isCorrect") is True or o.get("correct") is True:
-                        correct_idx = i
-                else:
-                    options.append(_clean(str(o)))
+            def _parse_lang(lang_block):
+                if not isinstance(lang_block, dict): return {"text": "", "options": [], "correctIndex": -1}
+                txt = _clean_text(lang_block.get("value") or lang_block.get("questionText") or "")
+                opts_raw = lang_block.get("options") or []
+                opts = []
+                ci = -1
+                for i, o in enumerate(opts_raw):
+                    if isinstance(o, dict):
+                        opt_text = _clean_text(o.get("value") or o.get("text") or "")
+                        opts.append(opt_text)
+                        if o.get("isCorrect") is True or o.get("correct") is True:
+                            ci = i
+                    else:
+                        opts.append(_clean_text(str(o)))
+                return {"text": txt, "options": opts, "correctIndex": ci}
+
+            en_data = _parse_lang(en)
+            hi_data = _parse_lang(hi)
+
+            # Pick English if available, else Hindi
+            primary = en_data if en_data["text"] else hi_data
 
             q_correct = q.get("correctAnswer") or q.get("correct")
 
@@ -202,11 +216,15 @@ def extract_questions_from_test_detail(data: dict) -> List[Dict]:
                 "id": qid,
                 "section": sec_title,
                 "type": q.get("type", "mcq"),
-                "text": text,
-                "options": options,
+                "text": primary["text"],
+                "options": primary["options"],
+                "text_hi": hi_data["text"],
+                "options_hi": hi_data["options"],
+                "text_en": en_data["text"],
+                "options_en": en_data["options"],
                 "posMarks": q.get("posMarks", 4),
                 "negMarks": q.get("negMarks", 1),
-                "correctIndex": correct_idx,
+                "correctIndex": primary["correctIndex"],
                 "correctAnswer": q_correct,
             })
     return questions
@@ -229,7 +247,7 @@ async def fetch_test_questions(token: str, test_id: str) -> Dict:
             dur = data.get("duration") or 0
             if dur > 1000: dur = dur // 60
             result["test_info"] = {
-                "title": data.get("title") or "Test",
+                "title": _clean_text(data.get("title") or "Test"),
                 "duration": dur,
                 "totalQuestions": sum(len(s.get("questions", [])) for s in data.get("sections", [])),
             }
@@ -265,7 +283,6 @@ position:sticky;top:0;z-index:100;box-shadow:0 4px 14px rgba(0,0,0,.15);flex-wra
 .topbar .nav{display:flex;gap:6px;font-size:12px;flex-wrap:wrap}
 .topbar .nav a{color:#fff;text-decoration:none;padding:6px 12px;
 background:rgba(255,255,255,.18);border-radius:8px;font-weight:600}
-.topbar .nav a:hover{background:rgba(255,255,255,.32)}
 .container{max-width:920px;margin:0 auto;padding:18px}
 .section-title{font-size:14px;font-weight:700;color:#4a5568;margin:8px 0 14px;
 text-transform:uppercase;letter-spacing:.5px}
@@ -305,48 +322,67 @@ border-top-color:#4f46e5;border-radius:50%;animation:spin .8s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
 .loading-box{text-align:center;padding:50px 20px}
 .loading-box p{margin-top:16px;color:#718096;font-size:14px}
-/* Quiz UI */
-.quiz-header{background:#fff;border-radius:14px;padding:16px;margin-bottom:14px;
-box-shadow:0 2px 10px rgba(0,0,0,.06);position:sticky;top:66px;z-index:50}
-.quiz-header h2{font-size:15px;font-weight:700;color:#1a202c;margin-bottom:8px}
-.quiz-meta{display:flex;justify-content:space-between;font-size:12px;color:#718096;
-flex-wrap:wrap;gap:8px}
-.timer{font-weight:700;color:#4f46e5}
-.q-card{background:#fff;border-radius:14px;padding:18px;margin-bottom:14px;
-box-shadow:0 2px 10px rgba(0,0,0,.06);border-top:3px solid #4f46e5}
-.q-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
-.q-num{display:inline-block;background:#4f46e5;color:#fff;font-size:11px;
-font-weight:700;padding:4px 10px;border-radius:8px}
-.q-marks{font-size:11px;color:#718096}
-.q-marks .pos{color:#10b981;font-weight:700}
-.q-marks .neg{color:#ef4444;font-weight:700}
-.q-text{font-size:15px;line-height:1.65;color:#2d3748;margin-bottom:14px;white-space:pre-wrap;word-break:break-word}
-.opt{display:block;padding:13px 16px;background:#f7fafc;border-radius:10px;
-margin-bottom:10px;font-size:14px;color:#2d3748;border:2px solid #e2e8f0;
-cursor:pointer;transition:all .15s;user-select:none;word-break:break-word}
-.opt:hover{border-color:#a5b4fc;background:#f0f4ff}
-.opt.selected{border-color:#4f46e5;background:#eef2ff;font-weight:600}
-.opt.correct{border-color:#10b981;background:#d1fae5}
-.opt.wrong{border-color:#ef4444;background:#fee2e2}
-.opts-letter{display:inline-block;width:24px;height:24px;line-height:24px;
-text-align:center;background:#e2e8f0;border-radius:50%;font-size:12px;
-font-weight:700;margin-right:10px;color:#4a5568}
-.opt.selected .opts-letter{background:#4f46e5;color:#fff}
-.opt.correct .opts-letter{background:#10b981;color:#fff}
-.opt.wrong .opts-letter{background:#ef4444;color:#fff}
-.quiz-footer{background:#fff;border-radius:14px;padding:16px;margin-top:18px;
-box-shadow:0 2px 10px rgba(0,0,0,.06);display:flex;gap:10px;flex-wrap:wrap;
-position:sticky;bottom:14px;z-index:50}
-.quiz-footer button{flex:1;min-width:120px;padding:14px;border:none;border-radius:10px;
-font-size:14px;font-weight:700;cursor:pointer}
-.submit-btn{background:#10b981;color:#fff}
-.submit-btn:hover{background:#059669}
-.reset-btn{background:#e2e8f0;color:#4a5568}
-.reset-btn:hover{background:#cbd5e0}
+
+/* ===== TESTBOOK-STYLE QUIZ UI ===== */
+.tb-header{background:#fff;padding:12px 16px;position:sticky;top:56px;z-index:40;
+border-bottom:1px solid #e2e8f0;display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.tb-header .q-num-big{font-size:24px;font-weight:800;color:#1a202c;min-width:36px}
+.tb-header .q-stats{display:flex;gap:16px;font-size:12px;color:#4a5568;flex:1}
+.tb-header .q-stat{display:flex;flex-direction:column;align-items:center}
+.tb-header .q-stat .lbl{font-size:10px;color:#718096;text-transform:uppercase;letter-spacing:.5px}
+.tb-header .q-stat .val{font-size:13px;font-weight:700}
+.tb-header .marks-pos{color:#10b981}
+.tb-header .marks-neg{color:#ef4444}
+.tb-header .timer-box{background:#1a202c;color:#fff;padding:6px 14px;border-radius:8px;
+font-family:monospace;font-size:14px;font-weight:700;letter-spacing:1px}
+.tb-header .lang-select{padding:6px 12px;border:1.5px solid #e2e8f0;border-radius:8px;
+font-size:13px;font-weight:600;color:#4a5568;background:#fff;cursor:pointer;outline:none}
+.tb-header .lang-select:focus{border-color:#4f46e5}
+
+.tb-question{padding:20px 16px;background:#fff}
+.tb-question .q-text{font-size:16px;line-height:1.7;color:#1a202c;margin-bottom:20px;word-break:break-word;white-space:pre-wrap}
+.tb-opt{display:flex;align-items:flex-start;gap:12px;padding:14px 16px;
+background:#fff;border:1.5px solid #e2e8f0;border-radius:10px;margin-bottom:12px;
+cursor:pointer;transition:all .15s;font-size:15px;color:#1a202c;line-height:1.5;user-select:none}
+.tb-opt:hover{border-color:#a5b4fc;background:#f8faff}
+.tb-opt.selected{border-color:#4f46e5;background:#eef2ff}
+.tb-opt.correct{border-color:#10b981;background:#d1fae5}
+.tb-opt.wrong{border-color:#ef4444;background:#fee2e2}
+.tb-opt .radio{width:22px;height:22px;min-width:22px;border:2px solid #cbd5e0;
+border-radius:50%;display:flex;align-items:center;justify-content:center;margin-top:1px}
+.tb-opt.selected .radio{border-color:#4f46e5;background:#4f46e5}
+.tb-opt.selected .radio::after{content:'';width:8px;height:8px;background:#fff;border-radius:50%}
+.tb-opt.correct .radio{border-color:#10b981;background:#10b981}
+.tb-opt.wrong .radio{border-color:#ef4444;background:#ef4444}
+.tb-opt .opt-text{flex:1;word-break:break-word}
+
+.tb-nav{background:#fff;padding:12px 16px;display:flex;gap:10px;flex-wrap:wrap;
+border-top:1px solid #e2e8f0;position:sticky;bottom:0;z-index:40;
+box-shadow:0 -2px 10px rgba(0,0,0,.05)}
+.tb-nav button{flex:1;min-width:100px;padding:12px;border:none;border-radius:8px;
+font-size:14px;font-weight:700;cursor:pointer;transition:all .15s}
+.btn-mark{background:#e2e8f0;color:#4a5568}
+.btn-clear{background:#e2e8f0;color:#4a5568}
+.btn-save{background:#1fbad6;color:#fff}
+.btn-save:hover{background:#1899b0}
+.btn-prev{background:#e2e8f0;color:#4a5568}
+.btn-next{background:#1fbad6;color:#fff}
+
+.progress-bar{height:3px;background:#e2e8f0;position:sticky;top:104px;z-index:39}
+.progress-bar .fill{height:100%;background:linear-gradient(90deg,#4f46e5,#7c3aed);transition:width .2s}
+
 .result-box{background:linear-gradient(135deg,#4f46e5,#7c3aed);color:#fff;
-padding:24px;border-radius:14px;text-align:center;margin-bottom:18px}
+padding:24px;border-radius:14px;text-align:center;margin:16px}
 .result-box .score{font-size:42px;font-weight:900;margin:8px 0}
 .result-box .lbl{font-size:13px;opacity:.9}
+
+.q-indicator{display:inline-flex;align-items:center;justify-content:center;
+width:28px;height:28px;border-radius:6px;background:#e2e8f0;color:#4a5568;
+font-size:11px;font-weight:700;margin:2px;cursor:pointer}
+.q-indicator.answered{background:#4f46e5;color:#fff}
+.q-indicator.current{outline:2px solid #4f46e5;outline-offset:1px}
+.q-indicators{display:flex;flex-wrap:wrap;gap:4px;padding:12px 16px;background:#fff;
+border-bottom:1px solid #e2e8f0}
 """
 
 def shell(title: str, body: str) -> str:
@@ -357,7 +393,7 @@ def shell(title: str, body: str) -> str:
 <div class="nav"><a href="/dashboard">🏠 Home</a>
 <a href="/debug/probe">🔍 Debug</a>
 <a href="/logout">Logout</a></div></div>
-<div class="container">{body}</div>
+{body}
 </body></html>"""
 
 LOGIN_HTML = """<!DOCTYPE html><html><head><meta charset="UTF-8">
@@ -390,7 +426,7 @@ __ERROR__
 
 # ---------- Routes ----------
 @app.get("/health")
-async def health(): return {"status":"ok","version":"32.0.0"}
+async def health(): return {"status":"ok","version":"33.0.0"}
 
 @app.get("/", response_class=HTMLResponse)
 async def root(error: Optional[str] = None,
@@ -448,13 +484,13 @@ async def dashboard(session_cookie: Optional[str] = Cookie(None, alias="tb_sessi
             f'<span class="badge">Open Series →</span></a></div>'
             for item in series
         )
-        body = f"""{greeting}{stats_html}
+        body = f"""<div class="container">{greeting}{stats_html}
         <div class="section-title">📚 Test Series ({len(series)})</div>
-        <div class="row">{cards}</div>"""
+        <div class="row">{cards}</div></div>"""
     else:
-        body = f"""{greeting}{stats_html}
+        body = f"""<div class="container">{greeting}{stats_html}
         <div class="empty"><h2>😕 Series list load nahi hui</h2>
-        <a href="/debug/probe" class="btn">🔍 Debug</a></div>"""
+        <a href="/debug/probe" class="btn">🔍 Debug</a></div></div>"""
     return HTMLResponse(shell("Dashboard", body))
 
 @app.get("/series", response_class=HTMLResponse)
@@ -470,16 +506,16 @@ async def series_page(id: str = Query(...),
             if r.status_code == 200:
                 j = r.json()
                 if j.get("success"):
-                    title = j.get("data", {}).get("details", {}).get("name") or title
+                    title = _clean_text(j.get("data", {}).get("details", {}).get("name") or title)
     except Exception: pass
 
-    body = f"""<a href="/dashboard" class="back-btn">← Back</a>
+    body = f"""<div class="container"><a href="/dashboard" class="back-btn">← Back</a>
     <div class="info-box"><b>📚 {title}</b></div>
     <div id="loading" class="loading-box">
       <div class="spinner"></div>
       <p>Tests load ho rahe hain...</p>
     </div>
-    <div id="results"></div>
+    <div id="results"></div></div>
     <script>
       fetch('/api/series-tests?id={quote(id, safe="")}')
         .then(r => r.json())
@@ -517,29 +553,29 @@ async def api_series_tests(id: str = Query(...),
     except Exception as e:
         return {"tests": [], "error": str(e)}
 
-# ---------- TEST PAGE with quiz UI ----------
+# ---------- TEST PAGE — Testbook-style quiz UI ----------
 @app.get("/test", response_class=HTMLResponse)
 async def test_page(id: str = Query(...), name: str = Query(""),
                     session_cookie: Optional[str] = Cookie(None, alias="tb_session")):
     token = get_token(session_cookie)
     if not token: return RedirectResponse("/", status_code=302)
     title = name or "Test"
-    body = f"""<a href="javascript:history.back()" class="back-btn">← Back</a>
-    <div class="info-box"><b>🎯 {title}</b></div>
-    <div id="loading" class="loading-box">
+    body = f"""<div id="loading" class="loading-box">
       <div class="spinner"></div>
       <p>Questions load ho rahe hain...</p>
     </div>
     <div id="quiz"></div>
     <script>
-      fetch('/api/test-questions?id=' + encodeURIComponent({json.dumps(id)}))
+      const TEST_ID = {json.dumps(id)};
+      const TEST_NAME = {json.dumps(title)};
+      fetch('/api/test-questions?id=' + encodeURIComponent(TEST_ID))
         .then(r => r.json())
         .then(data => {{
           document.getElementById('loading').style.display = 'none';
           const box = document.getElementById('quiz');
           if (!data.questions || data.questions.length === 0) {{
             box.innerHTML = '<div class="empty"><h2>😕 Questions load nahi ho paye</h2>' +
-              '<p>' + (data.error || 'Is test ka question data API se nahi mila') + '</p>' +
+              '<p>' + (data.error || 'Question data API se nahi mila') + '</p>' +
               '<a href="/debug/probe" class="btn" style="margin-top:12px;">🔍 Debug</a></div>';
             return;
           }}
@@ -547,111 +583,217 @@ async def test_page(id: str = Query(...), name: str = Query(""),
         }});
 
       function renderQuiz(questions, info) {{
-        window.__answers = {{}}; window.__questions = questions;
+        window.__answers = {{}};
+        window.__questions = questions;
+        window.__current = 0;
+        window.__marked = {{}};
+        window.__lang = 'en';
+        window.__timeLeft = (info.duration || 30) * 60;
+        window.__timerInterval = null;
+
         const totalQs = questions.length;
-        const totalMarks = questions.reduce((s, q) => s + (q.posMarks || 4), 0);
 
-        let html = '<div class="quiz-header">' +
-          '<h2>' + {json.dumps(title)} + '</h2>' +
-          '<div class="quiz-meta">' +
-          '<span>📝 ' + totalQs + ' Qs · 🎯 ' + totalMarks + ' marks</span>' +
-          '<span class="timer" id="answered">Answered: 0 / ' + totalQs + '</span>' +
-          '</div></div>';
+        // Outer container
+        let html = '<div class="container" style="padding:0;max-width:100%">';
 
-        questions.forEach((q, i) => {{
-          html += '<div class="q-card">' +
-            '<div class="q-header">' +
-            '<span class="q-num">Q' + (i+1) + '</span>' +
-            '<span class="q-marks">' +
-            '<span class="pos">+' + (q.posMarks || 4) + '</span> / ' +
-            '<span class="neg">-' + (q.negMarks || 1) + '</span>' +
-            '</span></div>' +
-            '<div class="q-text">' + escapeHtml(q.text) + '</div>';
-          const letters = ['A','B','C','D','E','F','G','H'];
-          (q.options || []).forEach((opt, j) => {{
-            html += '<div class="opt" data-q="' + i + '" data-o="' + j + '" ' +
-              'onclick="selectOption(this,' + i + ',' + j + ')">' +
-              '<span class="opts-letter">' + letters[j] + '</span>' + escapeHtml(opt) + '</div>';
-          }});
-          html += '</div>';
-        }});
-
-        html += '<div class="quiz-footer">' +
-          '<button class="submit-btn" onclick="submitQuiz(' + totalQs + ')">✅ Submit Test</button>' +
-          '<button class="reset-btn" onclick="window.location.reload()">🔄 Reset</button>' +
+        // TOP HEADER (Testbook style)
+        html += '<div class="tb-header">' +
+          '<span class="q-num-big" id="qNum">1.</span>' +
+          '<div class="q-stats">' +
+          '<div class="q-stat"><span class="lbl">Marks</span>' +
+          '<span class="val"><span class="marks-pos">+' + (questions[0].posMarks || 4) + '</span> / ' +
+          '<span class="marks-neg">-' + (questions[0].negMarks || 1) + '</span></span></div>' +
+          '<div class="q-stat"><span class="lbl">Time</span>' +
+          '<span class="val" id="qTime">00:00</span></div>' +
+          '</div>' +
+          '<div class="timer-box" id="mainTimer">--:--</div>' +
+          '<select class="lang-select" id="langSelect" onchange="switchLang(this.value)">' +
+          '<option value="en">English</option>' +
+          '<option value="hi">हिंदी</option>' +
+          '</select>' +
           '</div>';
 
+        // Progress bar
+        html += '<div class="progress-bar"><div class="fill" id="progressFill" style="width:0%"></div></div>';
+
+        // Question indicators
+        html += '<div class="q-indicators" id="indicators"></div>';
+
+        // Question area
+        html += '<div class="tb-question" id="questionArea"></div>';
+
+        // Bottom nav
+        html += '<div class="tb-nav">' +
+          '<button class="btn-mark" onclick="markForReview()">Mark for Review</button>' +
+          '<button class="btn-clear" onclick="clearResponse()">Clear</button>' +
+          '<button class="btn-prev" onclick="prevQuestion()">← Prev</button>' +
+          '<button class="btn-save" onclick="saveAndNext()">Save & Next →</button>' +
+          '<button class="btn-next" style="background:#10b981" onclick="submitQuiz()">Submit</button>' +
+          '</div>';
+
+        html += '</div>';
         document.getElementById('quiz').innerHTML = html;
+
+        renderCurrentQuestion();
+        startTimer();
       }}
 
-      function selectOption(el, q, o) {{
-        document.querySelectorAll('.opt[data-q="' + q + '"]').forEach(a => a.classList.remove('selected'));
-        el.classList.add('selected');
-        window.__answers[q] = o;
+      function renderCurrentQuestion() {{
+        const q = window.__questions[window.__current];
+        const lang = window.__lang;
+        const qText = lang === 'hi' && q.text_hi ? q.text_hi : (lang === 'en' && q.text_en ? q.text_en : q.text);
+        const qOpts = lang === 'hi' && q.options_hi && q.options_hi.length ? q.options_hi :
+                     (lang === 'en' && q.options_en && q.options_en.length ? q.options_en : q.options);
+
+        document.getElementById('qNum').textContent = (window.__current + 1) + '.';
+        document.querySelector('.tb-header .marks-pos').textContent = '+' + (q.posMarks || 4);
+        document.querySelector('.tb-header .marks-neg').textContent = '-' + (q.negMarks || 1);
+
+        let html = '<div class="q-text">' + escapeHtml(qText) + '</div>';
+        qOpts.forEach((opt, j) => {{
+          const sel = window.__answers[window.__current] === j ? 'selected' : '';
+          html += '<div class="tb-opt ' + sel + '" data-opt="' + j + '" onclick="pickOption(' + j + ')">' +
+            '<div class="radio"></div>' +
+            '<div class="opt-text">' + escapeHtml(opt) + '</div></div>';
+        }});
+        document.getElementById('questionArea').innerHTML = html;
+
+        renderIndicators();
+        updateProgress();
+      }}
+
+      function renderIndicators() {{
+        let html = '';
+        for (let i = 0; i < window.__questions.length; i++) {{
+          const cls = (i === window.__current ? 'current ' : '') +
+                      (window.__answers[i] !== undefined ? 'answered' : '');
+          html += '<div class="q-indicator ' + cls + '" onclick="jumpTo(' + i + ')">' + (i+1) + '</div>';
+        }}
+        document.getElementById('indicators').innerHTML = html;
+      }}
+
+      function pickOption(j) {{
+        window.__answers[window.__current] = j;
+        document.querySelectorAll('.tb-opt').forEach(el => el.classList.remove('selected'));
+        document.querySelector('.tb-opt[data-opt="' + j + '"]').classList.add('selected');
+        renderIndicators();
+        updateProgress();
+      }}
+
+      function clearResponse() {{
+        delete window.__answers[window.__current];
+        renderCurrentQuestion();
+      }}
+
+      function markForReview() {{
+        window.__marked[window.__current] = !window.__marked[window.__current];
+        alert(window.__marked[window.__current] ? 'Marked for review' : 'Unmarked');
+      }}
+
+      function saveAndNext() {{
+        if (window.__current < window.__questions.length - 1) {{
+          window.__current++;
+          renderCurrentQuestion();
+          window.scrollTo({{ top: 0, behavior: 'smooth' }});
+        }} else {{
+          alert('Yeh last question hai. Submit dabayein.');
+        }}
+      }}
+
+      function prevQuestion() {{
+        if (window.__current > 0) {{
+          window.__current--;
+          renderCurrentQuestion();
+          window.scrollTo({{ top: 0, behavior: 'smooth' }});
+        }}
+      }}
+
+      function jumpTo(i) {{
+        window.__current = i;
+        renderCurrentQuestion();
+        window.scrollTo({{ top: 0, behavior: 'smooth' }});
+      }}
+
+      function switchLang(l) {{
+        window.__lang = l;
+        renderCurrentQuestion();
+      }}
+
+      function updateProgress() {{
         const total = window.__questions.length;
-        document.getElementById('answered').textContent = 'Answered: ' + Object.keys(window.__answers).length + ' / ' + total;
+        const ans = Object.keys(window.__answers).length;
+        const pct = (ans / total) * 100;
+        document.getElementById('progressFill').style.width = pct + '%';
       }}
 
-      function submitQuiz(total) {{
+      function startTimer() {{
+        if (window.__timerInterval) clearInterval(window.__timerInterval);
+        updateTimerDisplay();
+        window.__timerInterval = setInterval(() => {{
+          if (window.__timeLeft <= 0) {{
+            clearInterval(window.__timerInterval);
+            alert('Time up! Auto-submitting...');
+            submitQuiz();
+            return;
+          }}
+          window.__timeLeft--;
+          updateTimerDisplay();
+        }}, 1000);
+      }}
+
+      function updateTimerDisplay() {{
+        const t = window.__timeLeft;
+        const h = Math.floor(t / 3600);
+        const m = Math.floor((t % 3600) / 60);
+        const s = t % 60;
+        const pad = (n) => String(n).padStart(2, '0');
+        document.getElementById('mainTimer').textContent =
+          (h > 0 ? pad(h) + ':' : '') + pad(m) + ':' + pad(s);
+      }}
+
+      function submitQuiz() {{
+        if (!confirm('Submit karein? Attempted: ' + Object.keys(window.__answers).length + '/' + window.__questions.length)) return;
+        if (window.__timerInterval) clearInterval(window.__timerInterval);
         const answers = window.__answers || {{}}, questions = window.__questions || [];
         let attempted = Object.keys(answers).length;
-        let scoreable = 0, correct = 0;
+        let correct = 0, wrong = 0, scoreable = 0;
 
         questions.forEach((q, i) => {{
           let ci = q.correctIndex;
-          if (ci === undefined || ci < 0) ci = findCorrectIndex(q);
-          if (ci >= 0) scoreable++;
-          if (ci >= 0 && answers[i] === ci) correct++;
-
-          document.querySelectorAll('.opt[data-q="' + i + '"]').forEach((el, j) => {{
-            el.style.pointerEvents = 'none';
-            if (ci >= 0) {{
-              if (j === ci) el.classList.add('correct');
-              else if (answers[i] === j && j !== ci) el.classList.add('wrong');
-            }} else if (answers[i] === j) {{
-              el.classList.add('selected');
-            }}
-          }});
+          if (ci === undefined || ci < 0) ci = -1;
+          if (ci >= 0) {{
+            scoreable++;
+            if (answers[i] === ci) correct++;
+            else if (answers[i] !== undefined) wrong++;
+          }}
         }});
 
         const rb = document.createElement('div');
         rb.className = 'result-box';
 
         if (scoreable === 0) {{
-          rb.innerHTML = '<div class="lbl">Test Submitted</div>' +
-            '<div class="score">' + attempted + ' / ' + total + '</div>' +
-            '<div class="lbl">Attempted: ' + attempted + ' · Correct answers live tests me hidden hote hain</div>';
+          rb.innerHTML = '<div class="lbl">Test Submitted ✅</div>' +
+            '<div class="score">' + attempted + ' / ' + questions.length + '</div>' +
+            '<div class="lbl">Attempted · Live test me correct answers hidden hote hain</div>' +
+            '<button class="btn" style="background:#fff;color:#4f46e5;margin-top:16px;" onclick="window.location.reload()">🔄 Retake</button>';
         }} else {{
+          const totalMarks = (correct * 4) - (wrong * 1);
           rb.innerHTML = '<div class="lbl">Your Score</div>' +
-            '<div class="score">' + correct + ' / ' + total + '</div>' +
-            '<div class="lbl">Attempted: ' + attempted + ' · Correct: ' + correct + ' · Wrong: ' + (attempted - correct) + '</div>';
+            '<div class="score">' + correct + ' / ' + questions.length + '</div>' +
+            '<div class="lbl">Attempted: ' + attempted + ' · Correct: ' + correct + ' · Wrong: ' + wrong + '</div>' +
+            '<div class="lbl" style="margin-top:8px;">Approx Marks: ' + totalMarks + '</div>' +
+            '<button class="btn" style="background:#fff;color:#4f46e5;margin-top:16px;" onclick="window.location.reload()">🔄 Retake</button>';
         }}
-
-        const quizEl = document.getElementById('quiz');
-        quizEl.insertBefore(rb, quizEl.firstChild);
-        rb.scrollIntoView({{ behavior: 'smooth', block: 'start' }});
-      }}
-
-      function findCorrectIndex(q) {{
-        if (!q.correctAnswer) return -1;
-        const ca = String(q.correctAnswer).trim().toLowerCase();
-        for (let i = 0; i < (q.options||[]).length; i++) {{
-          if (String(q.options[i]).trim().toLowerCase() === ca) return i;
-        }}
-        return -1;
+        document.getElementById('quiz').innerHTML = '';
+        document.getElementById('quiz').appendChild(rb);
+        window.scrollTo({{ top: 0, behavior: 'smooth' }});
       }}
 
       function escapeHtml(s) {{
         if (s == null) return '';
-        s = String(s);
-        // Decode leftover HTML entities from server (double safety)
-        const ta = document.createElement('textarea');
-        ta.innerHTML = s;
-        s = ta.value;
-        // Then escape for safe display
-        const d = document.createElement('div');
-        d.textContent = s;
-        return d.innerHTML;
+        return String(s).replace(/[&<>"']/g, c => ({{
+          '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+        }}[c]));
       }}
     </script>"""
     return HTMLResponse(shell(title, body))
@@ -701,16 +843,14 @@ async def probe(session_cookie: Optional[str] = Cookie(None, alias="tb_session")
                     lines.append(f"=== PARSED RESULT ===")
                     lines.append(f"Test info: {json.dumps(result.get('test_info'), ensure_ascii=False)}")
                     lines.append(f"Questions found: {len(result['questions'])}")
-                    lines.append(f"Error: {result.get('error')}")
                     lines.append("")
-
                     if result["questions"]:
-                        lines.append("=== FIRST QUESTION (full) ===")
-                        lines.append(json.dumps(result["questions"][0], ensure_ascii=False, indent=2)[:800])
+                        lines.append("=== FIRST QUESTION (cleaned) ===")
+                        lines.append(json.dumps(result["questions"][0], ensure_ascii=False, indent=2)[:900])
     except Exception as e:
         lines.append(f"ERR: {e}")
 
-    body = f"""<a href="/dashboard" class="back-btn">← Back</a>
-    <div class="info-box">✅ FINAL — Cleaned questions + graceful scoring</div>
-    <div class="debug">{chr(10).join(lines)}</div>"""
+    body = f"""<div class="container"><a href="/dashboard" class="back-btn">← Back</a>
+    <div class="info-box">✅ Cleaned questions + Testbook-style quiz UI</div>
+    <div class="debug">{chr(10).join(lines)}</div></div>"""
     return HTMLResponse(shell("Debug", body))

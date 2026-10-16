@@ -7,13 +7,14 @@ import base64
 import hashlib
 import asyncio
 import httpx
+import html as html_lib
 from fastapi import FastAPI, Form, Cookie, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from typing import Optional, List, Dict, Any
 from urllib.parse import quote
 
-app = FastAPI(title="Testbook Mirror", version="31.0.0")
+app = FastAPI(title="Testbook Mirror", version="32.0.0")
 
 BASE_URL = "https://testbook.com"
 API_BASE = "https://api.testbook.com"
@@ -152,25 +153,24 @@ async def fetch_all_tests_for_series(token: str, series_id: str) -> List[Dict]:
             return normalize_tests(raw)
     except Exception: return []
 
-# ==========================================
-# ✅ CORRECT QUESTION PARSER — sections[].questions[]
-# ==========================================
+# ---------- Question text cleaner ----------
+def _clean(s: str) -> str:
+    """Decode HTML entities and clean question text."""
+    if not s:
+        return ""
+    s = str(s)
+    # Decode HTML entities multiple times (&amp;nbsp; → &nbsp; → space)
+    for _ in range(3):
+        new_s = html_lib.unescape(s)
+        if new_s == s:
+            break
+        s = new_s
+    s = s.replace("\u00a0", " ").replace("&nbsp;", " ")
+    s = s.strip()
+    return s
+
+# ---------- Question parser ----------
 def extract_questions_from_test_detail(data: dict) -> List[Dict]:
-    """Extract questions from /tests/{id} response structure.
-    
-    Structure:
-    data.sections[].questions[] = {
-        "_id": "qid",
-        "type": "mcq",
-        "posMarks": 4,
-        "negMarks": 1,
-        "en": {
-            "value": "Question text",
-            "options": [{"prompt": "1", "value": "Option text", "isCorrect": true/false}, ...]
-        },
-        "hi": { same structure for Hindi }
-    }
-    """
     questions = []
     sections = data.get("sections", [])
     for sec in sections:
@@ -178,34 +178,31 @@ def extract_questions_from_test_detail(data: dict) -> List[Dict]:
         for q in sec.get("questions", []):
             if not isinstance(q, dict): continue
             qid = q.get("_id") or q.get("id") or ""
-            
+
             # Prefer English, fallback Hindi
             en = q.get("en") or q.get("hi") or {}
             if not isinstance(en, dict): en = {}
-            text = en.get("value") or en.get("questionText") or ""
-            
-            # Options
+            text = _clean(en.get("value") or en.get("questionText") or "")
+
             opts_raw = en.get("options") or []
             options = []
             correct_idx = -1
             for i, o in enumerate(opts_raw):
                 if isinstance(o, dict):
-                    opt_text = o.get("value") or o.get("text") or ""
-                    options.append(str(opt_text))
-                    # Check for correct flag
+                    opt_text = _clean(o.get("value") or o.get("text") or "")
+                    options.append(opt_text)
                     if o.get("isCorrect") is True or o.get("correct") is True:
                         correct_idx = i
                 else:
-                    options.append(str(o))
-            
-            # Also check q-level correctAnswer
+                    options.append(_clean(str(o)))
+
             q_correct = q.get("correctAnswer") or q.get("correct")
-            
+
             questions.append({
                 "id": qid,
                 "section": sec_title,
                 "type": q.get("type", "mcq"),
-                "text": str(text),
+                "text": text,
                 "options": options,
                 "posMarks": q.get("posMarks", 4),
                 "negMarks": q.get("negMarks", 1),
@@ -215,7 +212,6 @@ def extract_questions_from_test_detail(data: dict) -> List[Dict]:
     return questions
 
 async def fetch_test_questions(token: str, test_id: str) -> Dict:
-    """Fetch test detail and extract questions."""
     s = quote(test_id, safe="")
     url = f"{API_BASE}/api/v2_1/tests/{s}?auth_code={quote(token, safe='')}&language=english"
     result = {"questions": [], "test_info": None, "error": None}
@@ -230,9 +226,11 @@ async def fetch_test_questions(token: str, test_id: str) -> Dict:
                 result["error"] = "success=false"
                 return result
             data = j.get("data", {})
+            dur = data.get("duration") or 0
+            if dur > 1000: dur = dur // 60
             result["test_info"] = {
                 "title": data.get("title") or "Test",
-                "duration": (data.get("duration") or 0) // 60 or data.get("duration"),  # seconds -> min
+                "duration": dur,
                 "totalQuestions": sum(len(s.get("questions", [])) for s in data.get("sections", [])),
             }
             result["questions"] = extract_questions_from_test_detail(data)
@@ -267,6 +265,7 @@ position:sticky;top:0;z-index:100;box-shadow:0 4px 14px rgba(0,0,0,.15);flex-wra
 .topbar .nav{display:flex;gap:6px;font-size:12px;flex-wrap:wrap}
 .topbar .nav a{color:#fff;text-decoration:none;padding:6px 12px;
 background:rgba(255,255,255,.18);border-radius:8px;font-weight:600}
+.topbar .nav a:hover{background:rgba(255,255,255,.32)}
 .container{max-width:920px;margin:0 auto;padding:18px}
 .section-title{font-size:14px;font-weight:700;color:#4a5568;margin:8px 0 14px;
 text-transform:uppercase;letter-spacing:.5px}
@@ -321,10 +320,10 @@ font-weight:700;padding:4px 10px;border-radius:8px}
 .q-marks{font-size:11px;color:#718096}
 .q-marks .pos{color:#10b981;font-weight:700}
 .q-marks .neg{color:#ef4444;font-weight:700}
-.q-text{font-size:15px;line-height:1.65;color:#2d3748;margin-bottom:14px;white-space:pre-wrap}
+.q-text{font-size:15px;line-height:1.65;color:#2d3748;margin-bottom:14px;white-space:pre-wrap;word-break:break-word}
 .opt{display:block;padding:13px 16px;background:#f7fafc;border-radius:10px;
 margin-bottom:10px;font-size:14px;color:#2d3748;border:2px solid #e2e8f0;
-cursor:pointer;transition:all .15s;user-select:none}
+cursor:pointer;transition:all .15s;user-select:none;word-break:break-word}
 .opt:hover{border-color:#a5b4fc;background:#f0f4ff}
 .opt.selected{border-color:#4f46e5;background:#eef2ff;font-weight:600}
 .opt.correct{border-color:#10b981;background:#d1fae5}
@@ -391,7 +390,7 @@ __ERROR__
 
 # ---------- Routes ----------
 @app.get("/health")
-async def health(): return {"status":"ok","version":"31.0.0"}
+async def health(): return {"status":"ok","version":"32.0.0"}
 
 @app.get("/", response_class=HTMLResponse)
 async def root(error: Optional[str] = None,
@@ -518,7 +517,7 @@ async def api_series_tests(id: str = Query(...),
     except Exception as e:
         return {"tests": [], "error": str(e)}
 
-# ---------- TEST PAGE with FULL quiz ----------
+# ---------- TEST PAGE with quiz UI ----------
 @app.get("/test", response_class=HTMLResponse)
 async def test_page(id: str = Query(...), name: str = Query(""),
                     session_cookie: Optional[str] = Cookie(None, alias="tb_session")):
@@ -553,7 +552,7 @@ async def test_page(id: str = Query(...), name: str = Query(""),
         const totalMarks = questions.reduce((s, q) => s + (q.posMarks || 4), 0);
 
         let html = '<div class="quiz-header">' +
-          '<h2>' + ({json.dumps(title)}) + '</h2>' +
+          '<h2>' + {json.dumps(title)} + '</h2>' +
           '<div class="quiz-meta">' +
           '<span>📝 ' + totalQs + ' Qs · 🎯 ' + totalMarks + ' marks</span>' +
           '<span class="timer" id="answered">Answered: 0 / ' + totalQs + '</span>' +
@@ -595,22 +594,39 @@ async def test_page(id: str = Query(...), name: str = Query(""),
 
       function submitQuiz(total) {{
         const answers = window.__answers || {{}}, questions = window.__questions || [];
-        let correct = 0, attempted = Object.keys(answers).length;
+        let attempted = Object.keys(answers).length;
+        let scoreable = 0, correct = 0;
+
         questions.forEach((q, i) => {{
           let ci = q.correctIndex;
           if (ci === undefined || ci < 0) ci = findCorrectIndex(q);
+          if (ci >= 0) scoreable++;
           if (ci >= 0 && answers[i] === ci) correct++;
+
           document.querySelectorAll('.opt[data-q="' + i + '"]').forEach((el, j) => {{
             el.style.pointerEvents = 'none';
-            if (j === ci) el.classList.add('correct');
-            else if (answers[i] === j && j !== ci) el.classList.add('wrong');
+            if (ci >= 0) {{
+              if (j === ci) el.classList.add('correct');
+              else if (answers[i] === j && j !== ci) el.classList.add('wrong');
+            }} else if (answers[i] === j) {{
+              el.classList.add('selected');
+            }}
           }});
         }});
+
         const rb = document.createElement('div');
         rb.className = 'result-box';
-        rb.innerHTML = '<div class="lbl">Your Score</div>' +
-          '<div class="score">' + correct + ' / ' + total + '</div>' +
-          '<div class="lbl">Attempted: ' + attempted + ' · Correct: ' + correct + ' · Wrong: ' + (attempted - correct) + '</div>';
+
+        if (scoreable === 0) {{
+          rb.innerHTML = '<div class="lbl">Test Submitted</div>' +
+            '<div class="score">' + attempted + ' / ' + total + '</div>' +
+            '<div class="lbl">Attempted: ' + attempted + ' · Correct answers live tests me hidden hote hain</div>';
+        }} else {{
+          rb.innerHTML = '<div class="lbl">Your Score</div>' +
+            '<div class="score">' + correct + ' / ' + total + '</div>' +
+            '<div class="lbl">Attempted: ' + attempted + ' · Correct: ' + correct + ' · Wrong: ' + (attempted - correct) + '</div>';
+        }}
+
         const quizEl = document.getElementById('quiz');
         quizEl.insertBefore(rb, quizEl.firstChild);
         rb.scrollIntoView({{ behavior: 'smooth', block: 'start' }});
@@ -625,7 +641,18 @@ async def test_page(id: str = Query(...), name: str = Query(""),
         return -1;
       }}
 
-      function escapeHtml(s) {{ const d = document.createElement('div'); d.textContent = s == null ? '' : String(s); return d.innerHTML; }}
+      function escapeHtml(s) {{
+        if (s == null) return '';
+        s = String(s);
+        // Decode leftover HTML entities from server (double safety)
+        const ta = document.createElement('textarea');
+        ta.innerHTML = s;
+        s = ta.value;
+        // Then escape for safe display
+        const d = document.createElement('div');
+        d.textContent = s;
+        return d.innerHTML;
+      }}
     </script>"""
     return HTMLResponse(shell(title, body))
 
@@ -645,7 +672,7 @@ async def api_test_questions(id: str = Query(...),
     except Exception as e:
         return {"questions": [], "error": str(e)}
 
-# ---------- Debug: show parsed questions ----------
+# ---------- Debug ----------
 @app.get("/debug/probe", response_class=HTMLResponse)
 async def probe(session_cookie: Optional[str] = Cookie(None, alias="tb_session")):
     token = get_token(session_cookie)
@@ -678,17 +705,12 @@ async def probe(session_cookie: Optional[str] = Cookie(None, alias="tb_session")
                     lines.append("")
 
                     if result["questions"]:
-                        lines.append("=== FIRST 2 QUESTIONS (full) ===")
-                        for q in result["questions"][:2]:
-                            lines.append(json.dumps(q, ensure_ascii=False, indent=2)[:800])
-                            lines.append("")
-                        lines.append("=== ALL QUESTION TITLES ===")
-                        for i, q in enumerate(result["questions"][:20], 1):
-                            lines.append(f"  Q{i}: {q['text'][:70]} | opts={len(q['options'])} | correctIdx={q['correctIndex']}")
+                        lines.append("=== FIRST QUESTION (full) ===")
+                        lines.append(json.dumps(result["questions"][0], ensure_ascii=False, indent=2)[:800])
     except Exception as e:
         lines.append(f"ERR: {e}")
 
     body = f"""<a href="/dashboard" class="back-btn">← Back</a>
-    <div class="info-box">✅ FINAL — Sections se parsed questions</div>
+    <div class="info-box">✅ FINAL — Cleaned questions + graceful scoring</div>
     <div class="debug">{chr(10).join(lines)}</div>"""
     return HTMLResponse(shell("Debug", body))

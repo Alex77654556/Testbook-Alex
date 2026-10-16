@@ -3,9 +3,10 @@ import os
 import hmac
 import base64
 import hashlib
+import traceback
 import httpx
-from fastapi import FastAPI, HTTPException, Response, Form, Cookie, Query
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi import FastAPI, HTTPException, Response, Form, Cookie, Query, Request
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from bs4 import BeautifulSoup
 from pydantic import BaseModel
 from typing import List, Optional
@@ -23,8 +24,7 @@ BASE_URL = "https://testbook.com"
 DEFAULT_PATH = "/rrb-group-d/test-series/my"
 TARGET_URL = BASE_URL + DEFAULT_PATH
 
-# Sirf cookie signing ke liye — token nahi. Random string set karo env me.
-SESSION_SECRET = os.getenv("SESSION_SECRET", "change-me-please-please")
+SESSION_SECRET = os.getenv("SESSION_SECRET", "change-me-please-please-12345")
 
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -33,7 +33,6 @@ UA = (
 
 
 def get_headers(token: str) -> dict:
-    """Bearer token ke saath headers banao."""
     return {
         "User-Agent": UA,
         "Authorization": f"Bearer {token}",
@@ -45,7 +44,7 @@ def get_headers(token: str) -> dict:
     }
 
 
-# ---------- Signed cookie helpers (stateless — Vercel/Serverless friendly) ----------
+# ---------- Signed cookie helpers ----------
 def sign_token(token: str) -> str:
     data = base64.urlsafe_b64encode(token.encode()).decode()
     sig = hmac.new(SESSION_SECRET.encode(), data.encode(), hashlib.sha256).hexdigest()[:16]
@@ -64,7 +63,6 @@ def unsign_token(cookie: str) -> Optional[str]:
 
 
 def get_token(session_cookie: Optional[str]) -> Optional[str]:
-    """Sirf cookie se token lo. Koi hardcoded fallback nahi."""
     if not session_cookie:
         return None
     return unsign_token(session_cookie)
@@ -83,7 +81,25 @@ class ScrapeResult(BaseModel):
     tests: List[TestInfo]
 
 
-# ---------- Login page HTML ----------
+# ---------- Global error handler ----------
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    tb = traceback.format_exc()
+    print("===== ERROR =====")
+    print(tb)
+    print("=================")
+    return HTMLResponse(
+        f"""<!DOCTYPE html><html><body style="font-family:sans-serif;padding:30px;background:#fff5f5;">
+        <h1 style="color:#c53030;">Internal Server Error</h1>
+        <p>Kuch galat ho gaya. Vercel logs me detail milegi.</p>
+        <pre style="background:#fff;padding:16px;border-radius:8px;overflow:auto;font-size:12px;">{html_lib.escape(tb)}</pre>
+        <a href="/" style="display:inline-block;margin-top:16px;padding:10px 20px;background:#667eea;color:#fff;text-decoration:none;border-radius:8px;">← Login Page</a>
+        </body></html>""",
+        status_code=500,
+    )
+
+
+# ---------- Login page ----------
 LOGIN_PAGE = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -114,9 +130,9 @@ LOGIN_PAGE = """<!DOCTYPE html>
   button {
     width: 100%; padding: 13px; background: linear-gradient(135deg, #667eea, #764ba2);
     color: #fff; border: none; border-radius: 10px; font-size: 15px; font-weight: 600;
-    cursor: pointer; margin-top: 20px; transition: transform .15s, box-shadow .15s;
+    cursor: pointer; margin-top: 20px;
   }
-  button:hover { transform: translateY(-1px); box-shadow: 0 8px 20px rgba(102,126,234,.4); }
+  button:hover { opacity: .92; }
   .hint {
     margin-top: 20px; padding: 14px; background: #f7fafc; border-radius: 10px;
     font-size: 12px; color: #4a5568; line-height: 1.7;
@@ -145,7 +161,7 @@ LOGIN_PAGE = """<!DOCTYPE html>
       1. <b>testbook.com</b> par login karein.<br>
       2. Browser me <b>F12</b> → <b>Network</b> tab kholein.<br>
       3. Koi bhi <code>/api/</code> request par click karein → <b>Headers</b> → <code>Authorization: Bearer ...</code><br>
-      4. Sirf token ka part (jo <code>eyJ...</code> se shuru hota hai) copy karke yahan paste karein.
+      4. Sirf token ka part (jo <code>eyJ...</code> se shuru hota hai) copy karke paste karein.
     </div>
   </div>
 </body>
@@ -178,7 +194,6 @@ def make_topbar(current_url: str) -> str:
     )
 
 
-# ---------- URL rewriter (Testbook links → /proxy) ----------
 def rewrite_links(soup: BeautifulSoup) -> BeautifulSoup:
     pairs = [
         ("a", "href"),
@@ -206,7 +221,6 @@ def rewrite_links(soup: BeautifulSoup) -> BeautifulSoup:
             if "testbook.com" in absolute:
                 form["action"] = f"/proxy?url={quote(absolute, safe='')}"
 
-    # CSP meta tags hataao taaki humara topbar + scripts chal sakein
     for meta in soup.find_all("meta"):
         if meta.get("http-equiv", "").lower() == "content-security-policy":
             meta.decompose()
@@ -214,7 +228,6 @@ def rewrite_links(soup: BeautifulSoup) -> BeautifulSoup:
     return soup
 
 
-# ---------- Core proxy renderer ----------
 async def render_proxy(url: str, token: str) -> Response:
     try:
         async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
@@ -226,7 +239,6 @@ async def render_proxy(url: str, token: str) -> Response:
             status_code=502,
         )
 
-    # Token invalid / expire → wapas login page
     if r.status_code in (401, 403):
         resp = RedirectResponse("/?error=session", status_code=302)
         resp.delete_cookie("tb_session")
@@ -241,7 +253,6 @@ async def render_proxy(url: str, token: str) -> Response:
 
     soup = BeautifulSoup(r.text, "html.parser")
 
-    # Har page ke top par toolbar inject karo
     if soup.body:
         bar = BeautifulSoup(make_topbar(url), "html.parser")
         soup.body.insert(0, bar)
@@ -261,7 +272,6 @@ async def root(
     error: Optional[str] = None,
     session_cookie: Optional[str] = Cookie(None, alias="tb_session"),
 ):
-    # Agar already logged in hai to dashboard bhej do
     if get_token(session_cookie):
         return RedirectResponse("/dashboard", status_code=302)
 
@@ -281,11 +291,9 @@ async def login(token: str = Form(...)):
             status_code=400,
         )
 
-    # Agar user "Bearer xxx" format me paste kare to strip kar do
     if token.lower().startswith("bearer "):
         token = token[7:].strip()
 
-    # Token ko Testbook ke saath validate karo
     try:
         async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
             r = await client.get(TARGET_URL, headers=get_headers(token))
@@ -315,7 +323,7 @@ async def login(token: str = Form(...)):
         httponly=True,
         samesite="lax",
         max_age=7 * 24 * 3600,
-        secure=False,  # HTTPS only par True kar do
+        secure=False,
     )
     return resp
 
@@ -348,7 +356,6 @@ async def proxy(
     return await render_proxy(url, token)
 
 
-# ---------- Simple HTML parser ----------
 def parse_tests(html: str) -> List[TestInfo]:
     soup = BeautifulSoup(html, "html.parser")
     tests: List[TestInfo] = []
@@ -378,7 +385,6 @@ def parse_tests(html: str) -> List[TestInfo]:
     return tests
 
 
-# ---------- JSON API ----------
 @app.get("/api/tests", response_model=ScrapeResult, tags=["Scraper"])
 async def api_tests(session_cookie: Optional[str] = Cookie(None, alias="tb_session")):
     token = get_token(session_cookie)

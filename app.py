@@ -2,12 +2,12 @@
 import os, json, time, hmac, base64, hashlib, asyncio, httpx, html as html_lib, re
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, Form, Cookie, Query, Request
-from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, Response as FastResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from typing import Optional, List, Dict, Any
-from urllib.parse import quote
+from urllib.parse import quote, urljoin
 
-app = FastAPI(title="Testbook Mirror", version="38.0.0")
+app = FastAPI(title="Testbook Mirror", version="39.0.0")
 BASE_URL = "https://testbook.com"
 API_BASE = "https://api.testbook.com"
 SESSION_SECRET = os.getenv("SESSION_SECRET", "testbook-secret-98765")
@@ -48,13 +48,22 @@ def get_user_info(token: str) -> dict:
     p = decode_jwt_payload(token) or {}
     return {"name": p.get("name") or "User", "email": p.get("email") or "", "isPaid": p.get("isPaidUser", False)}
 
+# ⚡ NEW: tb_headers with X-Client
 def tb_headers(token: str, html_mode: bool = False) -> Dict[str, str]:
     h = {
-        "Authorization": f"Bearer {token}", "User-Agent": UA,
+        "Authorization": f"Bearer {token}",
+        "User-Agent": UA,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" if html_mode else "application/json, text/plain, */*",
-        "Accept-Language": "en-US,en;q=0.9", "Accept-Encoding": "identity",
-        "Referer": BASE_URL + "/", "Origin": BASE_URL,
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "identity",
+        "Referer": BASE_URL + "/",
+        "Origin": BASE_URL,
         "Cookie": f"tb_token={token}",
+        # ⚡ These were missing earlier
+        "X-Client": "web,1.4",
+        "X-Requested-With": "XMLHttpRequest",
+        "X-App-Version": "web-1.4",
+        "x-platform": "web",
     }
     return h
 
@@ -77,193 +86,115 @@ async def fetch_stats(token: str) -> Optional[dict]:
     except: pass
     return None
 
-# =============================================
-# APPROACH 1: HTML SCRAPING with embedded JSON
-# =============================================
-async def scrape_page_for_series(token: str, path: str) -> Dict:
-    """Fetch page HTML and extract series from embedded JSON + DOM."""
-    result = {"series": [], "scripts_info": [], "dom_series": [], "html_len": 0}
-    try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=20) as client:
-            r = await client.get(BASE_URL + path, headers=tb_headers(token, html_mode=True))
-            result["html_len"] = len(r.text)
-            if r.status_code != 200:
-                return result
+# ⚡ ENROLLED SERIES: focused on the null registeredTests field
+ENROLLED_ATTEMPTS = [
+    # /all with different type params
+    (f"{ALL_API}?type=registered", "GET", None),
+    (f"{ALL_API}?type=enrolled", "GET", None),
+    (f"{ALL_API}?type=my", "GET", None),
+    (f"{ALL_API}?include=registered", "GET", None),
+    (f"{ALL_API}?show=registered", "GET", None),
+    (f"{ALL_API}?include=enrolled", "GET", None),
+    (f"{ALL_API}?fetch=registered", "GET", None),
+    (f"{ALL_API}?registered=true", "GET", None),
+    (f"{ALL_API}?all=true", "GET", None),
+    (f"{ALL_API}?full=true", "GET", None),
+    # POST attempts
+    (f"{ALL_API}", "POST", {}),
+    (f"{ALL_API}", "POST", {"type": "registered"}),
+    (f"{ALL_API}", "POST", {"filter": "enrolled"}),
+    # Explicit registered/enrolled
+    (f"{API_BASE}/api/v2_1/live-panel/registered", "GET", None),
+    (f"{API_BASE}/api/v2_1/live-panel/registeredTests", "GET", None),
+    (f"{API_BASE}/api/v2_1/live-panel/registered-tests", "GET", None),
+    (f"{API_BASE}/api/v2_1/live-panel/enrolled", "GET", None),
+    (f"{API_BASE}/api/v2_1/live-panel/enrolledTests", "GET", None),
+    (f"{API_BASE}/api/v2_1/live-panel/enrolled-tests", "GET", None),
+    (f"{API_BASE}/api/v2_1/live-panel/my", "GET", None),
+    (f"{API_BASE}/api/v2_1/live-panel/my-tests", "GET", None),
+    (f"{API_BASE}/api/v2_1/live-panel/my-list", "GET", None),
+    (f"{API_BASE}/api/v2_1/live-panel/tests", "GET", None),
+    (f"{API_BASE}/api/v2_1/live-panel/test", "GET", None),
+    (f"{API_BASE}/api/v2_1/live-panel/tests-list", "GET", None),
+    # User based
+    (f"{API_BASE}/api/v2_1/me/tests", "GET", None),
+    (f"{API_BASE}/api/v2_1/me/my-tests", "GET", None),
+    (f"{API_BASE}/api/v2_1/user/tests", "GET", None),
+    (f"{API_BASE}/api/v2_1/user/registered-tests", "GET", None),
+    (f"{API_BASE}/api/v2_1/users/me/tests", "GET", None),
+    # v2 versions with X-Client
+    (f"{API_BASE}/api/v2/live-panel/all", "GET", None),
+    (f"{API_BASE}/api/v2/live-panel/registered", "GET", None),
+]
 
-            soup = BeautifulSoup(r.text, "html.parser")
-
-            # 1. Look for embedded JSON in script tags
-            for sc in soup.find_all("script"):
-                sid = sc.get("id") or ""
-                stype = sc.get("type") or ""
-                content = sc.string or ""
-                if not content.strip(): continue
-
-                # Angular TransferState / state scripts
-                if "state" in sid.lower() or "json" in stype or "ng-state" in sid.lower():
-                    result["scripts_info"].append({"id": sid, "type": stype, "len": len(content)})
-                    try:
-                        data = json.loads(content)
-                        # Walk for series
-                        found = []
-                        _walk_any_series(data, found)
-                        result["series"].extend(found)
-                    except Exception:
-                        pass
-
-            # 2. Look in inline <script> for window.__STATE__ = {...}
-            for sc in soup.find_all("script"):
-                txt = sc.string or ""
-                if not txt or len(txt) < 200: continue
-                for var in ("__INITIAL_STATE__", "__APP_STATE__", "__DATA__", "window.__state", "__NG_STATE__"):
-                    m = re.search(re.escape(var) + r"\s*=\s*(\{.*?\});", txt, re.DOTALL)
-                    if m:
-                        try:
-                            data = json.loads(m.group(1))
-                            found = []
-                            _walk_any_series(data, found)
-                            result["series"].extend(found)
-                        except Exception:
-                            pass
-
-            # 3. DOM scraping — find links with /test-series/
-            for a in soup.find_all("a", href=True):
-                href = a["href"]
-                if "/test-series/" not in href: continue
-                title = a.get_text(" ", strip=True)
-                if not title or len(title) < 5: continue
-                # Extract TSID from href
-                parts = href.rstrip("/").split("/")
-                tid = ""
-                for i, p in enumerate(parts):
-                    if p == "test-series" and i + 1 < len(parts):
-                        tid = parts[i+1]
-                        break
-                if tid and len(tid) > 8:
-                    result["dom_series"].append({"id": tid, "title": title, "href": href})
-    except Exception as e:
-        result["error"] = str(e)
-    return result
-
-def _walk_any_series(node, out, depth=0):
-    if depth > 15: return
+def _walk_registered(node, out, depth=0):
+    if depth > 12: return
     if isinstance(node, list):
-        for x in node: _walk_any_series(x, out, depth+1)
+        for x in node: _walk_registered(x, out, depth+1)
     elif isinstance(node, dict):
         k = set(node.keys())
-        # Series detector: has id + name, AND has progress-ish OR test count OR link pattern
-        has_id = ("id" in k or "_id" in k or "seriesId" in k or "testSeriesId" in k or "tsid" in k)
-        has_name = ("name" in k or "title" in k or "seriesName" in k)
-        has_meta = bool(k & {"totalTests", "testsCount", "totalQuestions", "attempted",
-                              "testsAttempted", "completedTests", "purchased", "enrolled",
-                              "progress", "price", "type"})
-        # Exclude question-like objects
-        not_question = not bool(k & {"posMarks", "negMarks", "questionCount", "questionText"})
-        if has_id and has_name and has_meta and not_question:
-            sid = str(node.get("id") or node.get("_id") or node.get("seriesId") or node.get("testSeriesId") or node.get("tsid") or "")
-            if sid and len(sid) > 8:
-                out.append({
-                    "id": sid,
-                    "title": _clean(node.get("name") or node.get("title") or node.get("seriesName") or ""),
-                    "totalTests": node.get("totalTests") or node.get("testsCount") or 0,
-                    "attempted": node.get("attempted") or node.get("testsAttempted") or 0,
-                    "slug": node.get("slug") or "",
-                })
+        is_test = (("id" in k or "_id" in k) and ("title" in k or "name" in k) and
+                   bool(k & {"questionCount","duration","totalMark","totalMarks","testType","posMarks","attempted"}))
+        is_series = (("id" in k or "_id" in k or "seriesId" in k or "testSeriesId" in k) and
+                     ("name" in k or "title" in k) and
+                     bool(k & {"totalTests","testsCount","attempted","testsAttempted","enrolled","purchased"}))
+        if is_test:
+            out.append({"kind": "test", "id": str(node.get("id") or node.get("_id") or ""),
+                        "title": _clean(node.get("title") or node.get("name") or ""),
+                        "total": node.get("questionCount") or 0,
+                        "attempted": node.get("attempted") or 0})
+        elif is_series:
+            out.append({"kind": "series", "id": str(node.get("id") or node.get("_id") or node.get("seriesId") or node.get("testSeriesId") or ""),
+                        "title": _clean(node.get("name") or node.get("title") or ""),
+                        "total": node.get("totalTests") or node.get("testsCount") or 0,
+                        "attempted": node.get("attempted") or node.get("testsAttempted") or 0})
         for v in node.values():
-            if isinstance(v, (list, dict)): _walk_any_series(v, out, depth+1)
+            if isinstance(v, (list, dict)): _walk_registered(v, out, depth+1)
 
-# =============================================
-# APPROACH 2: More endpoint attempts (POST + variants)
-# =============================================
-def more_endpoints(token: str) -> List[Dict]:
-    """Return list of {m: GET/POST, u: url, b: body}"""
-    urls = []
-    # GET variants on live-panel
-    for ep in ["enrolled", "enrolled-series", "enrolled-test-series", "my-series",
-               "my-test-series", "my-courses", "recent-series", "recent-test-series",
-               "dashboard", "home", "panel", "panel-data", "user-series", "user-test-series",
-               "series", "all-series", "purchased", "purchased-series", "purchased-test-series",
-               "subscriptions", "user-subscriptions", "me", "user", "profile",
-               "activity", "recent-activity", "continue-watching", "resume"]:
-        urls.append({"m": "GET", "u": f"{API_BASE}/api/v2_1/live-panel/{ep}"})
-        urls.append({"m": "GET", "u": f"{API_BASE}/api/v2_1/live-panel/{ep}?page=1&limit=50"})
-
-    # Me-based
-    for ep in ["enrolled", "test-series", "series", "dashboard", "home", "my-series", "purchased"]:
-        urls.append({"m": "GET", "u": f"{API_BASE}/api/v2_1/me/{ep}"})
-        urls.append({"m": "GET", "u": f"{API_BASE}/api/v2_1/users/me/{ep}"})
-
-    # v2 variants
-    for ep in ["enrolled", "test-series", "my-series", "dashboard"]:
-        urls.append({"m": "GET", "u": f"{API_BASE}/api/v2/me/{ep}"})
-        urls.append({"m": "GET", "u": f"{API_BASE}/api/v2/users/me/{ep}"})
-
-    # All with query params
-    urls.append({"m": "GET", "u": f"{ALL_API}?type=enrolled"})
-    urls.append({"m": "GET", "u": f"{ALL_API}?enrolled=true"})
-    urls.append({"m": "GET", "u": f"{ALL_API}?view=enrolled"})
-    urls.append({"m": "GET", "u": f"{ALL_API}?include=enrolled"})
-
-    return urls
-
-async def try_more_endpoints(token: str) -> Dict:
-    urls = more_endpoints(token)
-    result = {"hits": [], "raw_dumps": []}
-    async with httpx.AsyncClient(follow_redirects=True, timeout=8) as client:
-        async def try_one(e):
-            u = e["u"]
-            full = f"{u}{'&' if '?' in u else '?'}auth_code={quote(token,safe='')}&language=english"
+async def fetch_enrolled_v2(token: str) -> Dict:
+    result = {"winners": [], "items": [], "raw_preview": {}}
+    seen = set()
+    async with httpx.AsyncClient(follow_redirects=True, timeout=10) as client:
+        async def try_one(entry):
+            url, m, body = entry
+            full = f"{url}{'&' if '?' in url else '?'}auth_code={quote(token,safe='')}&language=english"
             try:
-                if e["m"] == "GET":
+                if m == "GET":
                     r = await client.get(full, headers=tb_headers(token))
                 else:
-                    r = await client.post(full, headers=tb_headers(token), json=e.get("b", {}))
+                    r = await client.post(full, headers=tb_headers(token), json=body or {})
                 if r.status_code != 200: return None
                 try: j = r.json()
                 except: return None
                 if not isinstance(j, dict) or not j.get("success"): return None
-                # Look for anything series-like
-                data = j.get("data", {})
-                # Get ALL keys with their types
-                keys_info = []
-                if isinstance(data, dict):
-                    for k, v in data.items():
-                        if isinstance(v, list): keys_info.append(f"{k}(list,{len(v)})")
-                        elif isinstance(v, dict): keys_info.append(f"{k}(dict,{len(v)})")
-                        else: keys_info.append(f"{k}={str(v)[:30]}")
-                elif isinstance(data, list):
-                    keys_info = [f"list(len={len(data)})"]
-
                 found = []
-                _walk_any_series(data, found)
-                return {"url": u, "series_count": len(found), "keys": keys_info,
-                        "preview": json.dumps(data, ensure_ascii=False)[:400], "series": found}
-            except Exception: return None
+                _walk_registered(j.get("data", {}), found)
+                return {"url": url, "items": found, "preview": json.dumps(j.get("data", {}), ensure_ascii=False)[:300]}
+            except: return None
 
-        results = await asyncio.gather(*[try_one(e) for e in urls], return_exceptions=True)
-
-    for res in results:
-        if not res or isinstance(res, Exception): continue
-        result["hits"].append({
-            "url": res["url"], "series_count": res["series_count"],
-            "keys": res["keys"][:8], "preview": res["preview"]
-        })
-        result["raw_dumps"].extend(res["series"])
+        results = await asyncio.gather(*[try_one(e) for e in ENROLLED_ATTEMPTS], return_exceptions=True)
+        for res in results:
+            if isinstance(res, Exception) or not res: continue
+            if res["items"]:
+                result["winners"].append({"url": res["url"], "count": len(res["items"])})
+                result["raw_preview"][res["url"]] = res["preview"]
+            for it in res["items"]:
+                key = f"{it['kind']}:{it['id']}"
+                if it["id"] and key not in seen:
+                    seen.add(key)
+                    result["items"].append(it)
     return result
 
-# =============================================
-# Series tests (unchanged)
-# =============================================
-def build_series_test_urls(tsid: str, slug: str) -> List[str]:
+# ---------- Series Tests ----------
+def build_series_test_urls(tsid: str) -> List[str]:
     s = quote(tsid, safe="")
-    urls = [
+    return [
         f"{ALL_API}?tsid={s}",
         f"{API_BASE}/api/v2_1/live-panel/test-series/{s}",
         f"{API_BASE}/api/v2_1/live-panel/test-series/{s}/tests",
         f"{API_BASE}/api/v2_1/test-series/{s}/tests",
         f"{API_BASE}/api/v2_1/tests?tsid={s}",
     ]
-    return urls
 
 def _walk_tests(node, out, depth=0):
     if depth > 15: return
@@ -290,7 +221,7 @@ def norm_tests(raw):
                     "isFree": bool(t.get("isFree"))})
     return out
 
-async def fetch_series_tests(token: str, tsid: str, slug: str = "") -> Dict:
+async def fetch_series_tests(token: str, tsid: str) -> Dict:
     result = {"tests": [], "winner": None}
     async with httpx.AsyncClient(follow_redirects=True, timeout=10) as client:
         async def try_u(u):
@@ -304,7 +235,7 @@ async def fetch_series_tests(token: str, tsid: str, slug: str = "") -> Dict:
                 _walk_tests(j.get("data", {}), raw)
                 return {"url": u, "raw": raw}
             except: return None
-        results = await asyncio.gather(*[try_u(u) for u in build_series_test_urls(tsid, slug)], return_exceptions=True)
+        results = await asyncio.gather(*[try_u(u) for u in build_series_test_urls(tsid)], return_exceptions=True)
         all_raw = []
         for res in results:
             if isinstance(res, Exception) or not res: continue
@@ -469,7 +400,7 @@ label{display:block;font-size:13px;color:#4a5568;font-weight:600;margin-bottom:8
 
 # ---------- Routes ----------
 @app.get("/health")
-async def health(): return {"status":"ok","version":"38.0.0"}
+async def health(): return {"status":"ok","version":"39.0.0"}
 
 @app.get("/", response_class=HTMLResponse)
 async def root(error: Optional[str] = None, session_cookie: Optional[str] = Cookie(None, alias="tb_session")):
@@ -494,31 +425,13 @@ async def login(token: str = Form(...)):
 async def logout():
     resp = RedirectResponse("/", status_code=302); resp.delete_cookie("tb_session"); return resp
 
-# ---------- DASHBOARD ----------
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard(session_cookie: Optional[str] = Cookie(None, alias="tb_session")):
     token = get_token(session_cookie)
     if not token: return RedirectResponse("/", status_code=302)
     user = get_user_info(token)
     stats = await fetch_stats(token)
-
-    # Try HTML scrape first
-    scrape = await scrape_page_for_series(token, "/online-test-series")
-    series_map = {}
-    for s in scrape["series"] + scrape["dom_series"]:
-        sid = s.get("id") or ""
-        if sid and sid not in series_map:
-            series_map[sid] = s
-
-    # If nothing found, try more endpoints
-    if not series_map:
-        more = await try_more_endpoints(token)
-        for s in more["raw_dumps"]:
-            sid = s.get("id") or ""
-            if sid and sid not in series_map:
-                series_map[sid] = s
-
-    all_series = list(series_map.values())
+    enrolled = await fetch_enrolled_v2(token)
 
     stats_html = ""
     if stats:
@@ -529,22 +442,25 @@ async def dashboard(session_cookie: Optional[str] = Cookie(None, alias="tb_sessi
     paid = " 💎" if user.get("isPaid") else ""
 
     series_cards = ""
-    for s in all_series[:20]:
-        total = s.get("totalTests") or 0
+    for s in [x for x in enrolled["items"] if x["kind"] == "series"][:20]:
+        total = s.get("total") or 0
         att = s.get("attempted") or 0
         pct = int((att / total) * 100) if total else 0
-        slug = s.get("slug") or ""
         series_cards += f"""<div class="series-card">
-          <a href="/series?id={quote(s['id'], safe='')}&slug={quote(slug, safe='')}">
+          <a href="/series?id={quote(s['id'], safe='')}">
             <h3>{s['title']}</h3>
             <div class="progress-row"><span>{att}/{total if total else '—'}</span><span>{pct}%</span></div>
             <div class="progress-bar"><div class="fill" style="width:{pct}%"></div></div>
             <div class="btn-go">Go To Test Series</div>
           </a></div>"""
 
-    hint = ""
-    if not all_series:
-        hint = f'<div class="empty"><h2>😕 Series nahi mili</h2><p>HTML len: {scrape["html_len"]}, scripts: {len(scrape["scripts_info"])}, dom: {len(scrape["dom_series"])}</p><a href="/debug/probe" class="btn" style="margin-top:12px;">🔍 Full Debug</a></div>'
+    test_cards = ""
+    for t in [x for x in enrolled["items"] if x["kind"] == "test"][:20]:
+        test_cards += f'<div class="card"><a href="/test?id={quote(t["id"], safe="")}&name={quote(t["title"], safe="")}">' \
+                      f'<h3>{t["title"]}</h3><p>{t.get("total",0)} Qs</p>' \
+                      f'<span class="badge green">Start Test →</span></a></div>'
+
+    debug_info = f'<div style="font-size:11px;color:#718096;margin-top:8px;">Winners: {len(enrolled["winners"])}, Total items: {len(enrolled["items"])}</div>'
 
     body = f"""<div class="container">
     <div class="info-box">✅ <b>Welcome, {user['name']}{paid}!</b><br>{user['email']}</div>
@@ -552,7 +468,10 @@ async def dashboard(session_cookie: Optional[str] = Cookie(None, alias="tb_sessi
     <form class="search-box" method="get" action="/search">
       <input type="text" name="q" placeholder="Search for your Exam" />
       <button type="submit">Search</button></form>
-    {f'<div class="section-title">📚 Your Test Series ({len(all_series)})</div><div class="row">{series_cards}</div>' if series_cards else hint}
+    {f'<div class="section-title">📚 Enrolled Series ({len([x for x in enrolled["items"] if x["kind"]=="series"])})</div><div class="row">{series_cards}</div>' if series_cards else ''}
+    {f'<div class="section-title">📝 Your Tests ({len([x for x in enrolled["items"] if x["kind"]=="test"])})</div><div class="row">{test_cards}</div>' if test_cards else ''}
+    {f'<div class="empty"><h2>😕 Data nahi mila</h2><p>X-Client header ke saath bhi API silent hai.</p><a href="/debug/probe" class="btn" style="margin-top:12px;">🔍 Full Debug</a></div>' if not enrolled["items"] else ''}
+    {debug_info}
     </div>"""
     return HTMLResponse(shell("Dashboard", body))
 
@@ -560,17 +479,13 @@ async def dashboard(session_cookie: Optional[str] = Cookie(None, alias="tb_sessi
 async def online_series(session_cookie: Optional[str] = Cookie(None, alias="tb_session")):
     token = get_token(session_cookie)
     if not token: return RedirectResponse("/", status_code=302)
-    scrape = await scrape_page_for_series(token, "/online-test-series")
-    series_map = {}
-    for s in scrape["series"] + scrape["dom_series"]:
-        sid = s.get("id") or ""
-        if sid and sid not in series_map: series_map[sid] = s
-    all_series = list(series_map.values())
-    cards = "".join(
-        f'<div class="card"><a href="/series?id={quote(s["id"], safe="")}">'
-        f'<h3>{s["title"]}</h3><span class="badge">Open →</span></a></div>' for s in all_series)
+    enrolled = await fetch_enrolled_v2(token)
+    cards = ""
+    for x in enrolled["items"]:
+        if x["kind"] == "series":
+            cards += f'<div class="card"><a href="/series?id={quote(x["id"], safe="")}"><h3>{x["title"]}</h3><p>{x.get("attempted",0)}/{x.get("total",0)}</p></a></div>'
     body = f'<div class="container"><a href="/dashboard" class="back-btn">← Back</a>' \
-           f'<div class="info-box"><b>📝 All Series ({len(all_series)})</b></div>' \
+           f'<div class="info-box"><b>📝 Series ({len([x for x in enrolled["items"] if x["kind"]=="series"])})</b></div>' \
            f'<div class="row">{cards if cards else "<div class=empty><h2>No series</h2></div>"}</div></div>'
     return HTMLResponse(shell("Series", body))
 
@@ -580,12 +495,13 @@ async def search_page(q: str = Query(""), session_cookie: Optional[str] = Cookie
     if not token: return RedirectResponse("/", status_code=302)
     results = []
     if q:
-        scrape = await scrape_page_for_series(token, "/online-test-series")
+        enrolled = await fetch_enrolled_v2(token)
         ql = q.lower()
-        for s in scrape["series"] + scrape["dom_series"]:
-            if ql in (s.get("title") or "").lower():
-                results.append(s)
-    cards = "".join(f'<div class="card"><a href="/series?id={quote(r["id"], safe="")}"><h3>{r["title"]}</h3></a></div>' for r in results)
+        for x in enrolled["items"]:
+            if ql in x["title"].lower(): results.append(x)
+    cards = "".join(
+        f'<div class="card"><a href="/{"test" if r["kind"]=="test" else "series"}?id={quote(r["id"], safe="")}"><h3>{r["title"]}</h3></a></div>'
+        for r in results)
     body = f'''<div class="container"><a href="/dashboard" class="back-btn">← Back</a>
     <form class="search-box" method="get" action="/search">
     <input type="text" name="q" value="{q}" placeholder="Search...">
@@ -594,23 +510,19 @@ async def search_page(q: str = Query(""), session_cookie: Optional[str] = Cookie
     return HTMLResponse(shell("Search", body))
 
 @app.get("/series", response_class=HTMLResponse)
-async def series_page(id: str = Query(...), slug: str = Query(""),
-                      session_cookie: Optional[str] = Cookie(None, alias="tb_session")):
+async def series_page(id: str = Query(...), session_cookie: Optional[str] = Cookie(None, alias="tb_session")):
     token = get_token(session_cookie)
     if not token: return RedirectResponse("/", status_code=302)
-    result = await fetch_series_tests(token, id, slug)
+    result = await fetch_series_tests(token, id)
     tests = result["tests"]
-    title = slug.replace("-", " ").title() if slug else "Test Series"
     cards = "".join(
         f'<div class="card"><a href="/test?id={quote(t["id"], safe="")}&name={quote(t["title"], safe="")}">'
         f'<h3>{t["title"]}</h3><p>{t["questionCount"]} Qs · {t["duration"]} min</p>'
         f'<span class="badge green">Start →</span></a></div>' for t in tests)
     body = f"""<div class="container"><a href="/dashboard" class="back-btn">← Back</a>
-    <div class="info-box"><b>📚 {title}</b><br>Total {len(tests)} tests</div>
-    <div class="section-title">📝 Tests</div>
-    <div class="row">{cards if cards else '<div class="empty"><h2>No tests</h2></div>'}</div>
-    </div>"""
-    return HTMLResponse(shell(title, body))
+    <div class="info-box"><b>📚 Series</b><br>Total {len(tests)} tests</div>
+    <div class="row">{cards if cards else '<div class="empty"><h2>No tests</h2></div>'}</div></div>"""
+    return HTMLResponse(shell("Series", body))
 
 @app.get("/test", response_class=HTMLResponse)
 async def test_page(id: str = Query(...), name: str = Query(""),
@@ -654,7 +566,6 @@ async def test_page(id: str = Query(...), name: str = Query(""),
       const qText=(lang==='hi'&&q.text_hi)?q.text_hi:(q.text_en||q.text);
       const qOpts=(lang==='hi'&&q.options_hi&&q.options_hi.length)?q.options_hi:(q.options_en||q.options);
       document.getElementById('qNum').textContent=(window.__current+1)+'.';
-      document.getElementById('qMarks').innerHTML='+'+(q.posMarks||4)+' / -'+(q.negMarks||1);
       let html='<div class="q-text">'+esc(qText)+'</div>';
       qOpts.forEach((opt,j)=>{{
         const sel=window.__answers[window.__current]===j?'selected':'';
@@ -710,60 +621,81 @@ async def api_test_questions(id: str = Query(...),
     except Exception as e:
         return {"questions": [], "error": str(e)}
 
-# ---------- FULL DEBUG ----------
+# ⚡ NEW: Proxy mode — Testbook page with token pre-injected
+@app.get("/proxy/{path:path}", response_class=HTMLResponse)
+async def proxy_page(path: str, request: Request,
+                     session_cookie: Optional[str] = Cookie(None, alias="tb_session")):
+    token = get_token(session_cookie)
+    if not token: return RedirectResponse("/", status_code=302)
+    target_url = f"{BASE_URL}/{path}"
+    if request.url.query: target_url += "?" + request.url.query
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=20) as client:
+            r = await client.get(target_url, headers=tb_headers(token, html_mode=True))
+        if r.status_code != 200:
+            return HTMLResponse(f"<h1>Testbook returned {r.status_code}</h1><p>{target_url}</p>", status_code=502)
+        # Inject token + rewrite relative URLs
+        html = r.text
+        # Inject base tag
+        if "<base" not in html.lower():
+            html = html.replace("<head>", f'<head><base href="{BASE_URL}/">', 1)
+        # Inject tb_token cookie setter + link fixer
+        inject = f"""
+<script>
+document.cookie = "tb_token={token}; path=/; max-age=604800; SameSite=Lax";
+window.__tbToken = "{token}";
+// Fix all relative links to go through /proxy/
+(function(){{
+  document.addEventListener('DOMContentLoaded', function(){{
+    document.querySelectorAll('a[href^="/"]').forEach(function(a){{
+      a.href = '/proxy' + a.getAttribute('href');
+    }});
+  }});
+}})();
+</script>
+"""
+        html = html.replace("</head>", inject + "</head>", 1)
+        return HTMLResponse(html)
+    except Exception as e:
+        return HTMLResponse(f"<h1>Proxy error</h1><pre>{e}</pre>", status_code=502)
+
+# ---------- Debug ----------
 @app.get("/debug/probe", response_class=HTMLResponse)
 async def probe(session_cookie: Optional[str] = Cookie(None, alias="tb_session")):
     token = get_token(session_cookie)
     if not token: return RedirectResponse("/", status_code=302)
-
     lines = []
     user = get_user_info(token)
     lines.append(f"User: {user.get('name')} | isPaid: {user.get('isPaid')}")
     lines.append("")
-
-    # --- Approach 1: HTML scrape ---
-    lines.append("=== APPROACH 1: HTML SCRAPE of /online-test-series ===")
-    scrape = await scrape_page_for_series(token, "/online-test-series")
-    lines.append(f"HTML length: {scrape['html_len']}")
-    lines.append(f"Script tags with JSON/state: {len(scrape['scripts_info'])}")
-    for si in scrape["scripts_info"][:10]:
-        lines.append(f"  <script id='{si['id']}' type='{si['type']}'> len={si['len']}")
-    lines.append(f"Series from JSON: {len(scrape['series'])}")
-    for s in scrape["series"][:10]:
-        lines.append(f"  → {s['title'][:60]} | {s['attempted']}/{s['totalTests']} | id={s['id'][:16]}")
-    lines.append(f"Series from DOM: {len(scrape['dom_series'])}")
-    for s in scrape["dom_series"][:10]:
-        lines.append(f"  → {s['title'][:60]} | href={s['href'][:60]}")
+    lines.append("=== ENROLLED SERIES v2 (with X-Client header) ===")
+    enrolled = await fetch_enrolled_v2(token)
+    lines.append(f"Winners: {len(enrolled['winners'])}")
+    for w in enrolled["winners"]:
+        lines.append(f"  ✅ {w['url']} → {w['count']} items")
+    lines.append(f"Total items: {len(enrolled['items'])}")
+    for it in enrolled["items"][:20]:
+        lines.append(f"  [{it['kind']}] {it['title'][:60]} | {it.get('attempted',0)}/{it.get('total',0)} | id={it['id'][:16]}")
     lines.append("")
-
-    # --- Approach 2: more endpoints ---
-    lines.append("=== APPROACH 2: MORE ENDPOINTS ===")
-    more = await try_more_endpoints(token)
-    lines.append(f"Hits: {len(more['hits'])}")
-    for h in more["hits"][:15]:
-        lines.append(f"  [{h['series_count']} series] {h['url']}")
-        lines.append(f"      keys: {h['keys']}")
-        if h['series_count'] > 0:
-            lines.append(f"      preview: {h['preview'][:200]}")
-    lines.append("")
-
-    # --- Approach 3: Fetch /online-test-series HTML and dump raw JSON in scripts ---
-    lines.append("=== APPROACH 3: RAW SCRIPT DUMP ===")
+    lines.append("=== RAW PREVIEWS ===")
+    for url, prev in enrolled["raw_preview"].items():
+        lines.append(f"  {url}")
+        lines.append(f"    {prev[:250]}")
+        lines.append("")
+    # Also test /all with X-Client
+    lines.append("=== /live-panel/all WITH X-Client HEADER ===")
     try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=20) as c:
-            r = await c.get(BASE_URL + "/online-test-series", headers=tb_headers(token, html_mode=True))
-            soup = BeautifulSoup(r.text, "html.parser")
-            for sc in soup.find_all("script"):
-                txt = sc.string or ""
-                if len(txt) > 500:
-                    sid = sc.get("id") or "(no-id)"
-                    stype = sc.get("type") or "(no-type)"
-                    lines.append(f"\n  Script [{sid}] type={stype} len={len(txt)}")
-                    lines.append(f"  First 300: {txt[:300]}")
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.get(f"{ALL_API}?auth_code={quote(token,safe='')}&language=english", headers=tb_headers(token))
+            j = r.json()
+            lines.append(f"Status: {r.status_code}, success: {j.get('success')}")
+            lines.append(f"Keys: {list(j.get('data', {}).keys())}")
+            lines.append(f"registeredTests: {j.get('data', {}).get('registeredTests')}")
+            lines.append(f"liveTests count: {len(j.get('data', {}).get('liveTests', []))}")
     except Exception as e:
-        lines.append(f"  ERR: {e}")
+        lines.append(f"ERR: {e}")
 
     body = f"""<div class="container"><a href="/dashboard" class="back-btn">← Back</a>
-    <div class="info-box">🔍 Full Debug — HTML scrape + more endpoints + raw scripts</div>
+    <div class="info-box">🔍 X-Client header ke saath endpoints</div>
     <div class="debug">{chr(10).join(lines)}</div></div>"""
     return HTMLResponse(shell("Debug", body))

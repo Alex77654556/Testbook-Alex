@@ -117,11 +117,10 @@ __ERROR__
 </div>
 </div></body></html>"""
 
-# ---------- The magic interceptor (very aggressive) ----------
+# ---------- The magic interceptor ----------
 INTERCEPTOR_JS = r"""
 (function(){
   var P = '/tb';
-  var TB = 'testbook.com';
   function fix(u){
     try{
       if(typeof u !== 'string') return u;
@@ -136,7 +135,7 @@ INTERCEPTOR_JS = r"""
   }
   window.__tbFix = fix;
 
-  // 1) Try to override window.location via delete trick
+  // 1) Try to override window.location
   try {
     var _realLoc = window.location;
     delete window.location;
@@ -154,7 +153,6 @@ INTERCEPTOR_JS = r"""
       }
     });
   } catch(e){
-    // fallback: patch assign/replace
     try { var _a = location.assign; location.assign = function(u){ return _a.call(location, fix(u)); }; } catch(_){}
     try { var _r = location.replace; location.replace = function(u){ return _r.call(location, fix(u)); }; } catch(_){}
   }
@@ -251,9 +249,6 @@ INTERCEPTOR_JS = r"""
       });
     }
   } catch(e){}
-
-  // 10) Kill location.href writes at the source by observing
-  console.log('[TB-MIRROR] interceptor installed');
 })();
 """
 
@@ -289,7 +284,7 @@ def _rewrite_url(v: str) -> str:
 def rewrite_html(html_text: str) -> str:
     soup = BeautifulSoup(html_text, "html.parser")
 
-    # Remove CSP meta + referrer meta (they can cause issues)
+    # Remove CSP meta
     for meta in soup.find_all("meta"):
         he = (meta.get("http-equiv") or "").lower()
         if he in ("content-security-policy", "content-security-policy-report-only", "refresh"):
@@ -337,13 +332,12 @@ def rewrite_html(html_text: str) -> str:
             parts.append(" ".join(sp))
         el["srcset"] = ", ".join(parts)
 
-    # Inject interceptor at very top of <head> so it runs FIRST
+    # Inject interceptor at very top of <head>
     sc = soup.new_tag("script")
     sc.string = INTERCEPTOR_JS
     if soup.head:
         soup.head.insert(0, sc)
 
-    # Kill Google Tag Manager meta refresh helpers
     if soup.body:
         bar = BeautifulSoup(FLOATING_BAR, "html.parser")
         soup.body.append(bar)
@@ -388,10 +382,9 @@ async def tb_proxy(request: Request, path: str = "",
         "Accept-Language": request.headers.get("accept-language", "en-US,en;q=0.9"),
         "Referer": BASE_URL + "/",
     }
-    for h in ("content-type", "x-requested-with", "x-xsrf-token", "x-csrf-token", "range", "accept-encoding"):
+    for h in ("content-type", "x-requested-with", "x-xsrf-token", "x-csrf-token", "range"):
         if request.headers.get(h):
             fwd[h.title()] = request.headers[h]
-    # Disable br/gzip so we can rewrite HTML cleanly
     fwd["Accept-Encoding"] = "identity"
 
     cookie_parts = [f"tb_token={token}"]
@@ -413,7 +406,6 @@ async def tb_proxy(request: Request, path: str = "",
             status_code=502,
         )
 
-    # Redirects — rewrite Location
     if r.status_code in (301, 302, 303, 307, 308):
         loc = r.headers.get("location", "/")
         if loc.startswith(BASE_URL):
@@ -431,10 +423,13 @@ async def tb_proxy(request: Request, path: str = "",
         except Exception as e:
             text = f"<pre>Rewrite error: {html_lib.escape(str(e))}</pre>"
         resp = HTMLResponse(text, status_code=r.status_code)
-        # Strip frame-blocking headers
-        resp.headers.pop("x-frame-options", None)
-        resp.headers.pop("content-security-policy", None)
-        resp.headers.pop("content-security-policy-report-only", None)
+        
+        # --- YAHAN THI GALTI, AB FIX KAR DI ---
+        headers_to_remove = ["x-frame-options", "content-security-policy", "content-security-policy-report-only"]
+        for h in headers_to_remove:
+            if h in resp.headers:
+                del resp.headers[h]
+                
         return _copy_set_cookies(resp, r)
 
     resp = FastResponse(
@@ -473,7 +468,6 @@ async def login(token: str = Form(...)):
     if token.lower().startswith("bearer "):
         token = token[7:].strip()
 
-    # Validate
     try:
         async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
             r = await client.get(
@@ -506,12 +500,10 @@ async def login(token: str = Form(...)):
         )
 
     resp = RedirectResponse(TB_PREFIX + HOME_PATH, status_code=303)
-    # Our signed session cookie
     resp.set_cookie(
         "tb_session", sign_token(token),
         httponly=True, samesite="lax", max_age=7*24*3600, secure=False,
     )
-    # Testbook's own auth cookie so Angular picks up login
     resp.set_cookie(
         "tb_token", token,
         httponly=False, samesite="lax", max_age=7*24*3600, secure=False,

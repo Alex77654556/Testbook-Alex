@@ -6,6 +6,9 @@ import hmac
 import base64
 import hashlib
 import asyncio
+import re
+import secrets
+from datetime import datetime, timezone
 import httpx
 import html as html_lib
 from bs4 import BeautifulSoup
@@ -20,7 +23,12 @@ app = FastAPI(title="Testbook Mirror", version="38.0.0",
 
 BASE_URL = "https://testbook.com"
 API_BASE = "https://api.testbook.com"
-SESSION_SECRET = os.getenv("SESSION_SECRET", "testbook-secret-98765")
+# Use a strong persistent SESSION_SECRET in cloud deployments. If omitted, use an
+# ephemeral local-development secret rather than a known hard-coded key.
+SESSION_SECRET = os.getenv("SESSION_SECRET") or secrets.token_urlsafe(48)
+COOKIE_SECURE = os.getenv(
+    "COOKIE_SECURE", "true" if os.getenv("VERCEL") else "false"
+).strip().lower() in {"1", "true", "yes", "on"}
 UA = ("Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36")
 
@@ -56,10 +64,41 @@ def unsign_token(cookie: str) -> Optional[str]:
         return None
 
 
+def _jwt_exp_timestamp(exp) -> Optional[float]:
+    """Parse standard numeric JWT exp values and ISO-8601 exp values."""
+    if isinstance(exp, bool) or exp is None:
+        return None
+    if isinstance(exp, (int, float)):
+        return float(exp)
+    if isinstance(exp, str):
+        value = exp.strip()
+        if not value:
+            return None
+        try:
+            return float(value)
+        except ValueError:
+            pass
+        try:
+            # Testbook tokens may encode exp as an ISO-8601 string rather than
+            # the numeric Unix timestamp required by the JWT standard.
+            normalized = value[:-1] + "+00:00" if value.endswith(("Z", "z")) else value
+            parsed = datetime.fromisoformat(normalized)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.timestamp()
+        except (ValueError, OverflowError):
+            return None
+    return None
+
+
 def get_token(session_cookie: Optional[str]) -> Optional[str]:
     if not session_cookie:
         return None
-    return unsign_token(session_cookie)
+    token = unsign_token(session_cookie)
+    if not token:
+        return None
+    valid, _ = validate_jwt(token)
+    return token if valid else None
 
 
 def decode_jwt_payload(token: str) -> Optional[dict]:
@@ -78,8 +117,12 @@ def validate_jwt(token: str):
     if p is None:
         return False, "Token JWT format me nahi hai"
     exp = p.get("exp")
-    if exp and isinstance(exp, (int, float)) and exp < time.time():
-        return False, "Token expire ho gaya hai"
+    if exp is not None:
+        exp_ts = _jwt_exp_timestamp(exp)
+        if exp_ts is None:
+            return False, "Token expiry format samajh nahi aaya"
+        if exp_ts <= time.time():
+            return False, "Token expire ho gaya hai"
     if not any(k in p for k in ("sub", "email", "name", "phone")):
         return False, "Token me user info nahi mili"
     return True, "ok"
@@ -753,7 +796,14 @@ async def login(token: str = Form(...)):
     if stats is None:
         return HTMLResponse(LOGIN_HTML.replace("__ERROR__", '<div class="error">❌ Token invalid ya expire.</div>'), status_code=401)
     resp = RedirectResponse("/dashboard", status_code=303)
-    resp.set_cookie("tb_session", sign_token(token), httponly=True, samesite="lax", max_age=7 * 24 * 3600, secure=False)
+    exp_ts = _jwt_exp_timestamp((decode_jwt_payload(token) or {}).get("exp"))
+    cookie_lifetime = 7 * 24 * 3600
+    if exp_ts is not None:
+        cookie_lifetime = min(cookie_lifetime, max(1, int(exp_ts - time.time())))
+    resp.set_cookie(
+        "tb_session", sign_token(token), httponly=True, samesite="lax",
+        max_age=cookie_lifetime, secure=COOKIE_SECURE,
+    )
     return resp
 
 
@@ -1278,8 +1328,11 @@ async def _diagnose(token: str, target: str, timeout: float = 15.0) -> dict:
     sep = "&" if "?" in url else "?"
     full = url if "auth_code=" in url else f"{url}{sep}auth_code={quote(token, safe='')}&language=english"
 
+    # Never echo the credential-bearing URL into the browser or logs.
+    safe_display_url = re.sub(r"(?i)([?&]auth_code=)[^&]*", r"\1[REDACTED]", full)
+    safe_input = re.sub(r"(?i)([?&]auth_code=)[^&]*", r"\1[REDACTED]", target)
     info = {
-        "input": target, "url": full, "status": None, "elapsed_ms": None,
+        "input": safe_input, "url": safe_display_url, "status": None, "elapsed_ms": None,
         "response_size": 0, "content_type": None,
         "body_json": None, "body_text": None, "error": None,
         "headers": {}, "series": [], "tests": [],

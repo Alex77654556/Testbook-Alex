@@ -15,7 +15,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from typing import Optional, List, Dict, Any
 from urllib.parse import quote
 
-app = FastAPI(title="Testbook Mirror", version="39.0.0",
+app = FastAPI(title="Testbook Mirror", version="40.0.0",
               docs_url=None, redoc_url=None, openapi_url=None)
 
 BASE_URL = "https://testbook.com"
@@ -27,123 +27,72 @@ UA = ("Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 "
 COUNT_API = f"{API_BASE}/api/v2_1/live-panel/count"
 ALL_API = f"{API_BASE}/api/v2_1/live-panel/all"
 
-
-# ============================================================
-# 🚦 RATE LIMITER — ye sabse important fix hai
-# ============================================================
+# ---------- Rate Limiter ----------
 _rate_lock = asyncio.Lock()
 _last_req_time = 0.0
-MIN_DELAY = 1.2          # 1.2 sec between requests
-_429_wait = 30           # on 429, wait 30s
+MIN_DELAY = 1.5  # 1.5 sec delay to avoid 429
+_cache: Dict[str, tuple] = {}
+CACHE_TTL = 300
 
-# In-memory cache
-_cache: Dict[str, tuple] = {}   # url -> (timestamp, response_obj)
-CACHE_TTL = 300                  # 5 min
-
-
-async def rate_limited_get(client: httpx.AsyncClient, url: str, headers: dict, retries: int = 1):
-    """Sequential requests with auto rate-limit handling."""
+async def rate_limited_get(client: httpx.AsyncClient, url: str, headers: dict):
     global _last_req_time
     async with _rate_lock:
-        # Enforce delay
         now = time.time()
         wait = MIN_DELAY - (now - _last_req_time)
         if wait > 0:
             await asyncio.sleep(wait)
+        _last_req_time = time.time()
+        try:
+            return await client.get(url, headers=headers)
+        except Exception:
+            return None
 
-        for attempt in range(retries + 1):
-            try:
-                r = await client.get(url, headers=headers)
-                _last_req_time = time.time()
-
-                if r.status_code == 429 and attempt < retries:
-                    print(f"⚠️ 429 rate limit on {url[:60]} — waiting {_429_wait}s")
-                    await asyncio.sleep(_429_wait)
-                    continue
-
-                return r
-            except Exception as e:
-                _last_req_time = time.time()
-                if attempt >= retries:
-                    raise
-                await asyncio.sleep(2)
-    return None
-
-
-async def cached_get(client: httpx.AsyncClient, url: str, headers: dict, retries: int = 1):
-    """Get with cache + rate limit."""
+async def cached_get(client: httpx.AsyncClient, url: str, headers: dict):
     now = time.time()
     if url in _cache:
         ts, resp = _cache[url]
         if now - ts < CACHE_TTL:
-            print(f"💾 Cache hit: {url[:60]}")
             return resp
-
-    resp = await rate_limited_get(client, url, headers, retries)
+    resp = await rate_limited_get(client, url, headers)
     if resp is not None:
         _cache[url] = (time.time(), resp)
     return resp
 
-
-# ---------- HTML escape ----------
+# ---------- Helpers ----------
 def esc(s) -> str:
-    if s is None:
-        return ""
+    if s is None: return ""
     return (str(s).replace("&", "&amp;").replace("<", "&lt;")
-            .replace(">", "&gt;").replace('"', "&quot;")
-            .replace("'", "&#39;"))
+            .replace(">", "&gt;").replace('"', "&quot;").replace("'", "&#39;"))
 
-
-# ---------- Token helpers ----------
 def sign_token(token: str) -> str:
     data = base64.urlsafe_b64encode(token.encode()).decode()
     sig = hmac.new(SESSION_SECRET.encode(), data.encode(), hashlib.sha256).hexdigest()[:16]
     return f"{data}.{sig}"
 
-
 def unsign_token(cookie: str) -> Optional[str]:
     try:
         data, sig = cookie.rsplit(".", 1)
         expected = hmac.new(SESSION_SECRET.encode(), data.encode(), hashlib.sha256).hexdigest()[:16]
-        if not hmac.compare_digest(sig, expected):
-            return None
+        if not hmac.compare_digest(sig, expected): return None
         return base64.urlsafe_b64decode(data.encode()).decode()
-    except Exception:
-        return None
-
+    except Exception: return None
 
 def get_token(session_cookie: Optional[str]) -> Optional[str]:
-    if not session_cookie:
-        return None
+    if not session_cookie: return None
     return unsign_token(session_cookie)
-
 
 def decode_jwt_payload(token: str) -> Optional[dict]:
     try:
         parts = token.split(".")
-        if len(parts) != 3:
-            return None
+        if len(parts) != 3: return None
         payload = parts[1] + "=" * (-len(parts[1]) % 4)
         return json.loads(base64.urlsafe_b64decode(payload))
-    except Exception:
-        return None
-
-
-def validate_jwt(token: str):
-    p = decode_jwt_payload(token)
-    if p is None:
-        return False, "Token JWT format me nahi hai"
-    exp = p.get("exp")
-    if exp and isinstance(exp, (int, float)) and exp < time.time():
-        return False, "Token expire ho gaya hai"
-    return True, "ok"
-
+    except Exception: return None
 
 def get_user_info(token: str) -> dict:
     p = decode_jwt_payload(token) or {}
     return {"name": p.get("name") or "User", "email": p.get("email") or "",
             "isPaid": p.get("isPaidUser", False), "userId": p.get("sub") or ""}
-
 
 def tb_headers(token: str) -> Dict[str, str]:
     return {
@@ -156,208 +105,88 @@ def tb_headers(token: str) -> Dict[str, str]:
         "Cookie": f"tb_token={token}",
     }
 
-
 async def fetch_stats(token: str) -> Optional[dict]:
     url = f"{COUNT_API}?auth_code={quote(token, safe='')}&language=english"
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            r = await rate_limited_get(client, url, tb_headers(token))
-            if r and r.status_code == 200:
-                j = r.json()
-                if j.get("success"):
-                    return j.get("data", {})
-    except Exception:
-        pass
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await cached_get(client, url, tb_headers(token))
+        if r and r.status_code == 200:
+            j = r.json()
+            if j.get("success"): return j.get("data", {})
     return None
 
-
-# ---------- Clean text ----------
 def _clean_text(s) -> str:
-    if s is None:
-        return ""
+    if s is None: return ""
     s = str(s)
     for _ in range(3):
         new_s = html_lib.unescape(s)
-        if new_s == s:
-            break
+        if new_s == s: break
         s = new_s
-    try:
-        s = BeautifulSoup(s, "html.parser").get_text()
-    except Exception:
-        pass
+    try: s = BeautifulSoup(s, "html.parser").get_text()
+    except Exception: pass
     return " ".join(s.replace("\u00a0", " ").split()).strip()
 
-
-# ---------- Extract series/tests ----------
+# ---------- STRICT Extraction Logic ----------
+# FIX: Ab hum "exam tags" ko test series nahi samjhenge. Sirf real series uthayenge.
 def _extract_series_from_obj(obj):
-    if not isinstance(obj, dict):
-        return None
+    if not isinstance(obj, dict): return None
+    
+    # Ignore specificExams / targetGroups (these are just tags)
+    keys = set(obj.keys())
+    if "isPrimary" in keys or "stateId" in keys or "targetGroup" in keys: return None
+    
     details = obj.get("details") or {}
-    if not isinstance(details, dict):
-        details = {}
     prog = obj.get("progress") or {}
-    if not isinstance(prog, dict):
-        prog = {}
-
-    sid = (obj.get("id") or obj.get("_id") or obj.get("seriesId")
-           or obj.get("tsid") or obj.get("slug")
-           or details.get("id") or details.get("_id") or details.get("slug"))
-    name = (obj.get("name") or obj.get("title") or obj.get("seriesName")
+    
+    sid = (obj.get("id") or obj.get("_id") or obj.get("seriesId") or obj.get("tsid") 
+           or details.get("id") or details.get("_id"))
+    name = (obj.get("name") or obj.get("title") or obj.get("seriesName") 
             or details.get("name") or details.get("title"))
-    if not sid or not name:
-        return None
+    
+    if not sid or not name: return None
 
-    keys = set(obj.keys()) | set(details.keys())
-    if keys & {"questionCount", "totalQuestions", "testType"} and "details" not in obj:
-        return None
+    # Agar test count ya progress object hai, tabhi ye real series hai
+    has_counts = ("totalTests" in obj or "testCount" in obj or "progress" in obj or 
+                  "totalTests" in details or "testCount" in details)
+    if not has_counts: return None
 
     purchase_info = obj.get("purchaseInfo") or details.get("purchaseInfo") or []
     is_free = any(isinstance(p, dict) and p.get("type") == "Free" for p in purchase_info)
-    has_access = bool(obj.get("hasAccess") or details.get("hasAccess") or is_free)
 
     return {
         "id": str(sid),
         "title": _clean_text(name),
         "description": _clean_text(str(obj.get("description") or details.get("description") or ""))[:150],
-        "totalTests": int(prog.get("total") or obj.get("totalTests") or obj.get("testCount") or 0),
+        "totalTests": int(prog.get("total") or obj.get("totalTests") or obj.get("testCount") or details.get("testCount") or 0),
         "attempted": int(prog.get("attempted") or obj.get("attempted") or 0),
-        "hasAccess": has_access,
+        "hasAccess": bool(obj.get("hasAccess") or details.get("hasAccess") or is_free),
         "isFree": is_free,
     }
 
-
 def _extract_test_from_obj(obj):
-    if not isinstance(obj, dict):
-        return None
-    details = obj.get("details") or {}
-    if not isinstance(details, dict):
-        details = {}
-    tid = obj.get("id") or obj.get("_id") or details.get("id")
-    title = obj.get("title") or obj.get("name") or details.get("title") or details.get("name")
-    if not tid or not title:
-        return None
-    keys = set(obj.keys()) | set(details.keys())
-    if not (keys & {"questionCount", "totalQuestions", "duration", "totalMark",
-                    "totalMarks", "testType", "isFree", "posMarks"}):
-        return None
+    if not isinstance(obj, dict): return None
+    tid = obj.get("id") or obj.get("_id")
+    title = obj.get("title") or obj.get("name")
+    if not tid or not title: return None
+    if not ("questionCount" in obj or "duration" in obj or "totalMarks" in obj): return None
     return {
         "id": str(tid),
         "title": _clean_text(title),
-        "questionCount": obj.get("questionCount") or obj.get("totalQuestions") or 0,
+        "questionCount": obj.get("questionCount") or 0,
         "duration": obj.get("duration") or 0,
         "isFree": bool(obj.get("isFree") or False),
     }
 
-
 def _walk(node, out_series, out_tests, depth=0):
-    if depth > 15:
-        return
+    if depth > 15: return
     if isinstance(node, list):
-        for x in node:
-            _walk(x, out_series, out_tests, depth + 1)
+        for x in node: _walk(x, out_series, out_tests, depth + 1)
     elif isinstance(node, dict):
         s = _extract_series_from_obj(node)
-        if s:
-            out_series.append(s)
+        if s: out_series.append(s)
         t = _extract_test_from_obj(node)
-        if t:
-            out_tests.append(t)
+        if t: out_tests.append(t)
         for v in node.values():
-            if isinstance(v, (list, dict)):
-                _walk(v, out_series, out_tests, depth + 1)
-
-
-# ============================================================
-# 🎯 SEQUENTIAL SERIES DISCOVERY — rate-limit safe
-# ============================================================
-
-async def discover_series_for_exam(token: str, exam_slug: str) -> Dict:
-    """Try endpoints ONE BY ONE with delay. Stop on first success."""
-    
-    # Priority order — most likely first (based on user's URL pattern "TS-ssc-mts")
-    candidates = [
-        # ⭐ HIGH PRIORITY — TS- prefix (from testbook.com/TS-ssc-mts/tests/...)
-        f"/api/v2_1/test-series/TS-{exam_slug}",
-        f"/api/v2_1/live-panel/all?tsid=TS-{exam_slug}",
-        f"/api/v2_1/test-series?slug=TS-{exam_slug}",
-        
-        # Exam-based
-        f"/api/v2_1/test-series?exam={exam_slug}",
-        f"/api/v2_1/test-series?exam={exam_slug}&type=my",
-        f"/api/v2_1/test-series?exam={exam_slug}&my=true",
-        
-        # Exam route based
-        f"/api/v2_1/exams/{exam_slug}/test-series",
-        f"/api/v2_1/exams/{exam_slug}/my/test-series",
-        f"/api/v2_1/exam/{exam_slug}/test-series",
-        
-        # My/user
-        f"/api/v2_1/my-test-series?exam={exam_slug}",
-        f"/api/v2_1/user/test-series?exam={exam_slug}",
-        f"/api/v2_1/users/me/test-series?exam={exam_slug}",
-    ]
-
-    result = {
-        "exam_slug": exam_slug,
-        "tried": [],
-        "working_path": None,
-        "series": [],
-        "tests": [],
-        "hit_429": False,
-    }
-
-    async with httpx.AsyncClient(follow_redirects=True, timeout=15.0) as client:
-        for path in candidates:
-            full = f"{API_BASE}{path}{'&' if '?' in path else '?'}auth_code={quote(token, safe='')}&language=english"
-            
-            try:
-                r = await rate_limited_get(client, full, tb_headers(token), retries=0)
-                if r is None:
-                    result["tried"].append({"path": path, "status": None, "error": "no response"})
-                    continue
-                
-                st = r.status_code
-                size = len(r.content)
-                
-                # 429 → stop immediately (don't hammer the API)
-                if st == 429:
-                    result["hit_429"] = True
-                    result["tried"].append({"path": path, "status": 429, "size": size})
-                    break
-                
-                entry = {"path": path, "status": st, "size": size}
-                
-                if st == 200:
-                    try:
-                        j = r.json()
-                        if isinstance(j, dict) and j.get("success"):
-                            series, tests = [], []
-                            _walk(j.get("data", {}), series, tests)
-                            entry["series"] = len(series)
-                            entry["tests"] = len(tests)
-                            result["tried"].append(entry)
-                            
-                            if series or tests:
-                                result["working_path"] = path
-                                result["series"] = series
-                                result["tests"] = tests
-                                return result
-                        else:
-                            entry["err"] = str(j.get("message", "no success"))[:60]
-                            result["tried"].append(entry)
-                    except Exception:
-                        result["tried"].append(entry)
-                else:
-                    result["tried"].append(entry)
-            except Exception as e:
-                result["tried"].append({"path": path, "error": str(e)[:80]})
-
-    return result
-
-
-# ============================================================
-# 📝 FETCH QUESTIONS — sequential, rate-limit safe
-# ============================================================
+            if isinstance(v, (list, dict)): _walk(v, out_series, out_tests, depth + 1)
 
 def extract_questions(data: dict) -> List[Dict]:
     questions = []
@@ -366,24 +195,18 @@ def extract_questions(data: dict) -> List[Dict]:
         sections = [{"title": "", "questions": data["questions"]}]
     
     for sec in sections:
-        sec_title = sec.get("title", "")
         for q in sec.get("questions", []):
-            if not isinstance(q, dict):
-                continue
-            qid = q.get("_id") or q.get("id") or ""
-
+            if not isinstance(q, dict): continue
+            
             def _parse(lang):
-                if not isinstance(lang, dict):
-                    return {"text": "", "options": [], "correctIndex": -1}
+                if not isinstance(lang, dict): return {"text": "", "options": [], "correctIndex": -1}
                 txt = _clean_text(lang.get("value") or lang.get("questionText") or "")
                 opts, ci = [], -1
                 for i, o in enumerate(lang.get("options") or []):
                     if isinstance(o, dict):
                         opts.append(_clean_text(o.get("value") or o.get("text") or ""))
-                        if o.get("isCorrect") is True or o.get("correct") is True:
-                            ci = i
-                    else:
-                        opts.append(_clean_text(str(o)))
+                        if o.get("isCorrect") is True or o.get("correct") is True: ci = i
+                    else: opts.append(_clean_text(str(o)))
                 return {"text": txt, "options": opts, "correctIndex": ci}
 
             en = _parse(q.get("en") or {})
@@ -391,7 +214,8 @@ def extract_questions(data: dict) -> List[Dict]:
             primary = en if en["text"] else hi
 
             questions.append({
-                "id": qid, "section": sec_title,
+                "id": q.get("_id") or q.get("id") or "", 
+                "section": sec.get("title", ""),
                 "text": primary["text"], "options": primary["options"],
                 "text_en": en["text"], "options_en": en["options"],
                 "text_hi": hi["text"], "options_hi": hi["options"],
@@ -400,171 +224,68 @@ def extract_questions(data: dict) -> List[Dict]:
             })
     return questions
 
-
-async def fetch_test_questions(token: str, test_id: str) -> Dict:
-    """Try multiple endpoints SEQUENTIALLY with rate limiting."""
-    s = quote(test_id, safe="")
-    candidates = [
-        f"/api/v2_1/tests/{s}",
-        f"/api/v2_1/tests/{s}?attemptNo=1",
-        f"/api/v2_1/test/{s}",
-        f"/api/v2_1/tests/{s}/detail",
-        f"/api/v2_1/tests/{s}/questions",
-    ]
-
-    result = {"questions": [], "test_info": None, "error": None, "endpoint_used": None, "tried": []}
-
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        for path in candidates:
-            full = f"{API_BASE}{path}{'&' if '?' in path else '?'}auth_code={quote(token, safe='')}&language=english"
-            try:
-                r = await rate_limited_get(client, full, tb_headers(token), retries=0)
-                if r is None:
-                    continue
-                result["tried"].append({"path": path, "status": r.status_code})
-                if r.status_code == 429:
-                    result["error"] = "Rate limit hit — 1 min baad try karo"
-                    break
-                if r.status_code != 200:
-                    continue
-                j = r.json()
-                if not j.get("success"):
-                    continue
-                data = j.get("data", {})
-                qs = extract_questions(data)
-                if qs:
-                    dur = data.get("duration") or 0
-                    if dur > 1000:
-                        dur = dur // 60
-                    result["questions"] = qs
-                    result["test_info"] = {
-                        "title": _clean_text(data.get("title") or "Test"),
-                        "duration": dur,
-                        "totalQuestions": len(qs),
-                    }
-                    result["endpoint_used"] = path
-                    return result
-            except Exception:
-                continue
-
-    if not result["error"]:
-        result["error"] = "Koi bhi endpoint ne questions nahi diye"
-    return result
-
-
-# ---------- Error handlers ----------
-@app.exception_handler(StarletteHTTPException)
-async def http_exc(request: Request, exc: StarletteHTTPException):
-    return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
-
-
-@app.exception_handler(Exception)
-async def all_exc(request: Request, exc: Exception):
-    import traceback
-    print("ERROR:", traceback.format_exc())
-    return HTMLResponse("<h1>Error</h1><p>/raw dump bhejo.</p>", status_code=500)
-
-
 # ---------- CSS ----------
 CSS = """
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
-background:#f0f4f8;color:#1a202c;min-height:100vh}
-.topbar{background:linear-gradient(135deg,#4f46e5,#7c3aed);color:#fff;
-padding:14px 18px;display:flex;align-items:center;justify-content:space-between;
-position:sticky;top:0;z-index:100;box-shadow:0 4px 14px rgba(0,0,0,.15);flex-wrap:wrap;gap:8px}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#f0f4f8;color:#1a202c;min-height:100vh}
+.topbar{background:linear-gradient(135deg,#4f46e5,#7c3aed);color:#fff;padding:14px 18px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:100;box-shadow:0 4px 14px rgba(0,0,0,.15);flex-wrap:wrap;gap:8px}
 .topbar h1{font-size:16px;font-weight:700}
 .topbar .nav{display:flex;gap:6px;font-size:12px;flex-wrap:wrap}
-.topbar .nav a{color:#fff;text-decoration:none;padding:6px 12px;
-background:rgba(255,255,255,.18);border-radius:8px;font-weight:600}
-.topbar .nav a:hover{background:rgba(255,255,255,.32)}
+.topbar .nav a{color:#fff;text-decoration:none;padding:6px 12px;background:rgba(255,255,255,.18);border-radius:8px;font-weight:600}
 .container{max-width:920px;margin:0 auto;padding:18px}
-.section-title{font-size:14px;font-weight:700;color:#4a5568;margin:20px 0 12px;
-text-transform:uppercase;letter-spacing:.5px}
-.card{background:#fff;border-radius:14px;padding:16px;margin-bottom:12px;
-box-shadow:0 2px 10px rgba(0,0,0,.06);border-left:4px solid #4f46e5}
+.section-title{font-size:14px;font-weight:700;color:#4a5568;margin:20px 0 12px;text-transform:uppercase;letter-spacing:.5px}
+.card{background:#fff;border-radius:14px;padding:16px;margin-bottom:12px;box-shadow:0 2px 10px rgba(0,0,0,.06);border-left:4px solid #4f46e5}
 .card a{text-decoration:none;color:#1a202c;display:block}
 .card h3{font-size:14px;font-weight:700;margin-bottom:6px;line-height:1.4}
 .card p{font-size:12px;color:#718096;line-height:1.55;margin-top:4px}
-.badge{display:inline-block;background:#eef2ff;color:#4f46e5;font-size:10px;
-font-weight:700;padding:3px 9px;border-radius:12px;margin-top:8px;
-text-transform:uppercase;letter-spacing:.3px}
+.badge{display:inline-block;background:#eef2ff;color:#4f46e5;font-size:10px;font-weight:700;padding:3px 9px;border-radius:12px;margin-top:8px;text-transform:uppercase;letter-spacing:.3px}
 .badge.green{background:#d1fae5;color:#059669}
 .badge.orange{background:#fed7aa;color:#c2410c}
 .badge.red{background:#fee2e2;color:#dc2626}
 .row{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px}
 .empty{text-align:center;padding:40px 20px;color:#a0aec0}
 .empty h2{font-size:18px;margin-bottom:8px;color:#4a5568}
-.btn{display:inline-block;padding:11px 20px;background:#4f46e5;color:#fff;
-border:none;border-radius:10px;font-size:14px;font-weight:600;text-decoration:none;cursor:pointer;text-align:center}
-.info-box{background:#eef2ff;border-radius:12px;padding:14px;margin-bottom:16px;
-font-size:13px;color:#3730a3;line-height:1.7}
-.warn-box{background:#fef3c7;border-radius:12px;padding:14px;margin-bottom:16px;
-font-size:13px;color:#78350f;line-height:1.7;border-left:4px solid #f59e0b}
+.btn{display:inline-block;padding:11px 20px;background:#4f46e5;color:#fff;border:none;border-radius:10px;font-size:14px;font-weight:600;text-decoration:none;cursor:pointer;text-align:center}
+.info-box{background:#eef2ff;border-radius:12px;padding:14px;margin-bottom:16px;font-size:13px;color:#3730a3;line-height:1.7}
+.warn-box{background:#fef3c7;border-radius:12px;padding:14px;margin-bottom:16px;font-size:13px;color:#78350f;line-height:1.7;border-left:4px solid #f59e0b}
 .stat-row{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:14px}
-.stat{background:#fff;padding:12px 16px;border-radius:12px;
-box-shadow:0 2px 8px rgba(0,0,0,.05);flex:1;min-width:110px;text-align:center}
+.stat{background:#fff;padding:12px 16px;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,.05);flex:1;min-width:110px;text-align:center}
 .stat .num{font-size:24px;font-weight:800;color:#4f46e5}
 .stat .lbl{font-size:11px;color:#718096;text-transform:uppercase;letter-spacing:.4px;margin-top:4px}
-.back-btn{display:inline-block;margin-bottom:14px;padding:8px 16px;
-background:#e2e8f0;color:#4a5568;border-radius:8px;text-decoration:none;
-font-size:13px;font-weight:600}
-.spinner{display:inline-block;width:36px;height:36px;border:4px solid #e2e8f0;
-border-top-color:#4f46e5;border-radius:50%;animation:spin .8s linear infinite}
-@keyframes spin{to{transform:rotate(360deg)}}
-.loading-box{text-align:center;padding:50px 20px}
 .search-box{display:flex;gap:8px;margin-bottom:18px}
 .search-box input{flex:1;padding:12px 16px;border:1.5px solid #e2e8f0;border-radius:10px;font-size:14px;outline:none}
-.search-box input:focus{border-color:#4f46e5}
 .search-box button{padding:12px 20px;background:#4f46e5;color:#fff;border:none;border-radius:10px;font-weight:600;cursor:pointer}
-.debug{background:#1a202c;color:#a0aec0;padding:14px;border-radius:10px;
-font-family:monospace;font-size:11px;overflow:auto;max-height:600px;line-height:1.5;white-space:pre-wrap;word-break:break-word}
+.back-btn{display:inline-block;margin-bottom:14px;padding:8px 16px;background:#e2e8f0;color:#4a5568;border-radius:8px;text-decoration:none;font-size:13px;font-weight:600}
+.tb-header{background:#fff;padding:12px 16px;position:sticky;top:56px;z-index:40;border-bottom:1px solid #e2e8f0;display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.tb-header .q-num-big{font-size:24px;font-weight:800;min-width:36px}
+.tb-header .q-stats{display:flex;gap:16px;font-size:12px;color:#4a5568;flex:1}
+.tb-header .timer-box{background:#1a202c;color:#fff;padding:6px 14px;border-radius:8px;font-family:monospace;font-size:14px;font-weight:700}
+.tb-header .lang-select{padding:6px 12px;border:1.5px solid #e2e8f0;border-radius:8px;font-size:13px;font-weight:600;background:#fff;cursor:pointer}
+.tb-question{padding:20px 16px;background:#fff}
+.tb-question .q-text{font-size:16px;line-height:1.7;margin-bottom:20px;white-space:pre-wrap}
+.tb-opt{display:flex;align-items:flex-start;gap:12px;padding:14px 16px;background:#fff;border:1.5px solid #e2e8f0;border-radius:10px;margin-bottom:12px;cursor:pointer;font-size:15px;line-height:1.5;user-select:none}
+.tb-opt.selected{border-color:#4f46e5;background:#eef2ff}
+.tb-opt .radio{width:22px;height:22px;min-width:22px;border:2px solid #cbd5e0;border-radius:50%}
+.tb-opt.selected .radio{border-color:#4f46e5;background:#4f46e5}
+.tb-nav{background:#fff;padding:12px 16px;display:flex;gap:10px;flex-wrap:wrap;border-top:1px solid #e2e8f0;position:sticky;bottom:0;z-index:40}
+.tb-nav button{flex:1;min-width:100px;padding:12px;border:none;border-radius:8px;font-size:14px;font-weight:700;cursor:pointer}
+.btn-clear,.btn-prev{background:#e2e8f0;color:#4a5568}
+.btn-save{background:#1fbad6;color:#fff}
+.btn-submit{background:#10b981;color:#fff}
+.q-indicator{display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;border-radius:6px;background:#e2e8f0;color:#4a5568;font-size:11px;font-weight:700;margin:2px;cursor:pointer}
+.q-indicator.answered{background:#4f46e5;color:#fff}
+.q-indicator.current{outline:2px solid #4f46e5;outline-offset:1px}
+.q-indicators{display:flex;flex-wrap:wrap;gap:4px;padding:12px 16px;background:#fff;border-bottom:1px solid #e2e8f0}
+.result-box{background:linear-gradient(135deg,#4f46e5,#7c3aed);color:#fff;padding:24px;border-radius:14px;text-align:center;margin:16px}
+.result-box .score{font-size:42px;font-weight:900;margin:8px 0}
+.step{background:#fff;border-radius:12px;padding:16px;margin-bottom:12px;box-shadow:0 2px 8px rgba(0,0,0,.05)}
+.step-num{display:inline-flex;align-items:center;justify-content:center;width:26px;height:26px;background:#4f46e5;color:#fff;border-radius:50%;font-weight:700;font-size:13px;margin-right:8px}
+.step code{background:#f7fafc;padding:2px 6px;border-radius:4px;font-family:monospace;font-size:12px;color:#4f46e5;border:1px solid #e2e8f0}
 .probe-row{padding:10px;border-bottom:1px solid #e2e8f0;display:flex;gap:8px;align-items:center;font-size:12px}
 .probe-row:last-child{border-bottom:none}
 .probe-status{font-weight:700;min-width:50px}
 .probe-path{flex:1;font-family:monospace;word-break:break-all}
-.tb-header{background:#fff;padding:12px 16px;position:sticky;top:56px;z-index:40;
-border-bottom:1px solid #e2e8f0;display:flex;align-items:center;gap:12px;flex-wrap:wrap}
-.tb-header .q-num-big{font-size:24px;font-weight:800;min-width:36px}
-.tb-header .q-stats{display:flex;gap:16px;font-size:12px;color:#4a5568;flex:1}
-.tb-header .timer-box{background:#1a202c;color:#fff;padding:6px 14px;border-radius:8px;
-font-family:monospace;font-size:14px;font-weight:700}
-.tb-header .lang-select{padding:6px 12px;border:1.5px solid #e2e8f0;border-radius:8px;font-size:13px;font-weight:600;background:#fff;cursor:pointer}
-.tb-question{padding:20px 16px;background:#fff}
-.tb-question .q-text{font-size:16px;line-height:1.7;margin-bottom:20px;white-space:pre-wrap}
-.tb-opt{display:flex;align-items:flex-start;gap:12px;padding:14px 16px;
-background:#fff;border:1.5px solid #e2e8f0;border-radius:10px;margin-bottom:12px;
-cursor:pointer;font-size:15px;line-height:1.5;user-select:none}
-.tb-opt.selected{border-color:#4f46e5;background:#eef2ff}
-.tb-opt .radio{width:22px;height:22px;min-width:22px;border:2px solid #cbd5e0;border-radius:50%}
-.tb-opt.selected .radio{border-color:#4f46e5;background:#4f46e5}
-.tb-nav{background:#fff;padding:12px 16px;display:flex;gap:10px;flex-wrap:wrap;
-border-top:1px solid #e2e8f0;position:sticky;bottom:0;z-index:40}
-.tb-nav button{flex:1;min-width:100px;padding:12px;border:none;border-radius:8px;font-size:14px;font-weight:700;cursor:pointer}
-.btn-mark,.btn-clear,.btn-prev{background:#e2e8f0;color:#4a5568}
-.btn-save{background:#1fbad6;color:#fff}
-.btn-submit{background:#10b981;color:#fff}
-.q-indicator{display:inline-flex;align-items:center;justify-content:center;
-width:28px;height:28px;border-radius:6px;background:#e2e8f0;color:#4a5568;
-font-size:11px;font-weight:700;margin:2px;cursor:pointer}
-.q-indicator.answered{background:#4f46e5;color:#fff}
-.q-indicator.current{outline:2px solid #4f46e5;outline-offset:1px}
-.q-indicators{display:flex;flex-wrap:wrap;gap:4px;padding:12px 16px;background:#fff;border-bottom:1px solid #e2e8f0}
-.result-box{background:linear-gradient(135deg,#4f46e5,#7c3aed);color:#fff;
-padding:24px;border-radius:14px;text-align:center;margin:16px}
-.result-box .score{font-size:42px;font-weight:900;margin:8px 0}
-.slug-chip{display:inline-block;background:#fff;border:1.5px solid #e2e8f0;border-radius:20px;
-padding:6px 14px;font-size:12px;font-weight:600;color:#4f46e5;text-decoration:none;margin:3px}
-.slug-chip:hover{background:#eef2ff;border-color:#4f46e5}
-.step{background:#fff;border-radius:12px;padding:16px;margin-bottom:12px;
-box-shadow:0 2px 8px rgba(0,0,0,.05)}
-.step-num{display:inline-flex;align-items:center;justify-content:center;
-width:26px;height:26px;background:#4f46e5;color:#fff;border-radius:50%;
-font-weight:700;font-size:13px;margin-right:8px}
-.step code{background:#f7fafc;padding:2px 6px;border-radius:4px;
-font-family:monospace;font-size:12px;color:#4f46e5;border:1px solid #e2e8f0}
 """
-
 
 def shell(title: str, body: str) -> str:
     return f"""<!DOCTYPE html><html><head><meta charset="UTF-8">
@@ -572,28 +293,23 @@ def shell(title: str, body: str) -> str:
 <title>{esc(title)} · Testbook Mirror</title><style>{CSS}</style></head><body>
 <div class="topbar"><h1>📚 Testbook Mirror</h1>
 <div class="nav"><a href="/dashboard">🏠 Home</a>
-<a href="/raw">🐛 Raw</a>
+<a href="/raw">🐛 Raw Data</a>
 <a href="/logout">Logout</a></div></div>
 {body}
 </body></html>"""
 
-
 LOGIN_HTML = """<!DOCTYPE html><html><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Login · Testbook Mirror</title><style>
+<title>Login</title><style>
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
-background:linear-gradient(135deg,#667eea,#764ba2);min-height:100vh;display:flex;
-align-items:center;justify-content:center;padding:20px}
-.card{background:#fff;border-radius:18px;box-shadow:0 20px 60px rgba(0,0,0,.3);
-padding:40px;width:100%;max-width:500px}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:linear-gradient(135deg,#667eea,#764ba2);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
+.card{background:#fff;border-radius:18px;box-shadow:0 20px 60px rgba(0,0,0,.3);padding:40px;width:100%;max-width:500px}
 h1{color:#1a202c;font-size:22px;text-align:center;margin-bottom:6px}
 p.sub{color:#718096;font-size:13px;text-align:center;margin-bottom:26px}
 label{display:block;font-size:13px;color:#4a5568;font-weight:600;margin-bottom:8px}
 textarea{width:100%;padding:13px;border:1.5px solid #e2e8f0;border-radius:10px;font-size:13px;font-family:monospace;resize:vertical}
 textarea:focus{outline:none;border-color:#667eea}
-button{width:100%;padding:14px;background:linear-gradient(135deg,#667eea,#764ba2);
-color:#fff;border:none;border-radius:10px;font-size:15px;font-weight:700;cursor:pointer;margin-top:20px}
+button{width:100%;padding:14px;background:linear-gradient(135deg,#667eea,#764ba2);color:#fff;border:none;border-radius:10px;font-size:15px;font-weight:700;cursor:pointer;margin-top:20px}
 .error{background:#fff5f5;color:#c53030;padding:12px;border-radius:8px;font-size:13px;margin-bottom:16px;text-align:center}
 </style></head><body><div class="card">
 <h1>🔐 Testbook Login</h1>
@@ -605,40 +321,34 @@ __ERROR__
 <button type="submit">Login →</button></form>
 </div></body></html>"""
 
-
 # ---------- Routes ----------
 @app.get("/health")
-async def health():
-    return {"status": "ok", "version": "39.0.0"}
-
+async def health(): return {"status": "ok"}
 
 @app.get("/", response_class=HTMLResponse)
-async def root(error: Optional[str] = None,
-               session_cookie: Optional[str] = Cookie(None, alias="tb_session")):
-    if get_token(session_cookie):
-        return RedirectResponse("/dashboard", status_code=302)
+async def root(session_cookie: Optional[str] = Cookie(None, alias="tb_session")):
+    if get_token(session_cookie): return RedirectResponse("/dashboard", status_code=302)
     return HTMLResponse(LOGIN_HTML.replace("__ERROR__", ""))
-
 
 @app.post("/login")
 async def login(token: str = Form(...)):
     token = token.strip()
     if not token:
         return HTMLResponse(LOGIN_HTML.replace("__ERROR__", '<div class="error">Token khali.</div>'), status_code=400)
-    if token.lower().startswith("bearer "):
-        token = token[7:].strip()
-    if "auth_code=" in token:
-        token = token.split("auth_code=")[1].split("&")[0]
-    ok, msg = validate_jwt(token)
-    if not ok:
-        return HTMLResponse(LOGIN_HTML.replace("__ERROR__", f'<div class="error">❌ {esc(msg)}</div>'), status_code=401)
+    if token.lower().startswith("bearer "): token = token[7:].strip()
+    if "auth_code=" in token: token = token.split("auth_code=")[1].split("&")[0]
+    
+    p = decode_jwt_payload(token)
+    if not p:
+        return HTMLResponse(LOGIN_HTML.replace("__ERROR__", f'<div class="error">❌ Token format galat hai.</div>'), status_code=401)
+        
     stats = await fetch_stats(token)
     if stats is None:
-        return HTMLResponse(LOGIN_HTML.replace("__ERROR__", '<div class="error">❌ Token invalid ya rate limited. 1 min baad try karo.</div>'), status_code=401)
+        return HTMLResponse(LOGIN_HTML.replace("__ERROR__", '<div class="error">❌ Token invalid ya rate limited.</div>'), status_code=401)
+        
     resp = RedirectResponse("/dashboard", status_code=303)
     resp.set_cookie("tb_session", sign_token(token), httponly=True, samesite="lax", max_age=7*24*3600, secure=False)
     return resp
-
 
 @app.get("/logout")
 async def logout():
@@ -646,12 +356,10 @@ async def logout():
     resp.delete_cookie("tb_session")
     return resp
 
-
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard(session_cookie: Optional[str] = Cookie(None, alias="tb_session")):
     token = get_token(session_cookie)
-    if not token:
-        return RedirectResponse("/", status_code=302)
+    if not token: return RedirectResponse("/", status_code=302)
 
     user = get_user_info(token)
     stats = await fetch_stats(token)
@@ -661,141 +369,65 @@ async def dashboard(session_cookie: Optional[str] = Cookie(None, alias="tb_sessi
         stats_html = f"""<div class="stat-row">
         <div class="stat"><div class="num">{stats.get('testsCount',0)}</div><div class="lbl">Tests</div></div>
         <div class="stat"><div class="num">{stats.get('quizzesCount',0)}</div><div class="lbl">Quizzes</div></div>
-        <div class="stat"><div class="num">{stats.get('videosCount',0)}</div><div class="lbl">Videos</div></div>
         </div>"""
 
-    paid_badge = " 💎" if user.get("isPaid") else ""
-    greeting = f'<div class="info-box">✅ <b>Welcome, {esc(user["name"])}{paid_badge}!</b> <br>{esc(user["email"])}</div>'
+    greeting = f'<div class="info-box">✅ <b>Welcome, {esc(user["name"])}!</b><br>{esc(user["email"])}</div>'
+
+    # Live quizzes section
+    live_tests_html = ""
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await cached_get(client, f"{ALL_API}?auth_code={quote(token, safe='')}&language=english", tb_headers(token))
+        if r and r.status_code == 200:
+            j = r.json()
+            if j.get("success"):
+                s_list, t_list = [], []
+                _walk(j.get("data", {}), s_list, t_list)
+                for t in t_list[:15]:
+                    live_tests_html += f"""
+                    <div class="card">
+                      <a href="/test?id={quote(t['id'], safe='')}&name={quote(t['title'], safe='')}">
+                        <h3>{esc(t['title'])}</h3>
+                        <p>📝 {t['questionCount']} Qs · ⏱ {t['duration']} min</p>
+                        <span class="badge green">Start →</span>
+                      </a>
+                    </div>"""
 
     body = f"""<div class="container">
     {greeting}
     {stats_html}
 
     <div class="warn-box">
-      <b>⚠️ Pehle padho (important):</b><br>
-      Testbook ka "my test series" endpoint hume abhi tak nahi mila — rate limit ki wajah se.
+      <b>🔍 Apni Purchased Test Series Kholo:</b><br>
+      Testbook ne apne API endpoints badal diye hain jisse automatic series detect nahi ho rahi. 
       <br><br>
-      <b>Sabse fast tarika:</b> DevTools se endpoint nikaalo (30 sec), phir niche paste karo.
-    </div>
-
-    <div class="section-title">🎯 3-Sec DevTools Method</div>
-    <div class="step"><span class="step-num">1</span>
-      Chrome me <code>testbook.com/ssc-mts/test-series/my</code> kholo (login karke)
-    </div>
-    <div class="step"><span class="step-num">2</span>
-      <code>F12</code> dabao → <b>Network</b> tab → filter me <code>api.testbook.com</code> type karo
-    </div>
-    <div class="step"><span class="step-num">3</span>
-      Page pe <b>refresh</b> karo — Network me nayi requests aayengi. Jo URL me <code>/test-series</code> ho, wahi hamara target hai.
-    </div>
-    <div class="step"><span class="step-num">4</span>
-      Us request pe <b>right-click → Copy → Copy URL</b> karo. Neeche paste karo 👇
+      <b>Aapka Total 224 Tests kahan hai?</b> Isko nikalne ke liye:
+      <ol style="margin-left: 20px; margin-top: 8px;">
+        <li>Browser me <b>testbook.com</b> login karke apni <b>"My Test Series"</b> page kholo.</li>
+        <li><b>F12</b> dabao → <b>Network</b> tab kholo.</li>
+        <li>Page ko Refresh karo (Ctrl+R).</li>
+        <li>Network list me jo URL me <code>api.testbook.com</code> aur <code>test-series</code> ho, usko <b>Right Click → Copy URL</b> karo.</li>
+        <li>Neeche paste karke <b>"Try URL"</b> dabao.</li>
+      </ol>
     </div>
 
     <form class="search-box" method="get" action="/try-url">
-      <input type="text" name="url" placeholder="https://api.testbook.com/api/v2_1/..." required>
-      <button type="submit">Try →</button>
+      <input type="text" name="url" placeholder="Paste Testbook API URL here..." required>
+      <button type="submit">Try URL</button>
     </form>
 
-    <div class="section-title">⚡ Ya Automatic Try Karo (slow, rate-limit safe)</div>
-    <form class="search-box" method="get" action="/exam">
-      <input type="text" name="slug" value="ssc-mts" placeholder="exam slug (e.g. ssc-mts)">
-      <button type="submit">Auto-Discover →</button>
-    </form>
-    <p style="font-size:12px;color:#718096">
-      Ye 12 endpoints sequentially try karega (1.2 sec gap). Agar 429 aaya to 30 sec wait karega.
-      Total time: 20-40 sec.
-    </p>
-
-    <div class="section-title">🐛 Raw Debug</div>
-    <a href="/raw" class="btn">Raw Viewer Kholo</a>
+    <div class="section-title">⚡ Live Quizzes (Working)</div>
+    <div class="row">{live_tests_html if live_tests_html else '<div class="empty">No live quizzes found.</div>'}</div>
     </div>"""
     return HTMLResponse(shell("Dashboard", body))
-
-
-@app.get("/exam", response_class=HTMLResponse)
-async def exam_page(slug: str = Query(...), session_cookie: Optional[str] = Cookie(None, alias="tb_session")):
-    token = get_token(session_cookie)
-    if not token:
-        return RedirectResponse("/", status_code=302)
-
-    r = await discover_series_for_exam(token, slug)
-    series = r["series"]
-    tests = r["tests"]
-
-    title = slug.replace("-", " ").title()
-
-    tried_html = ""
-    for t in r["tried"]:
-        st = t.get("status")
-        color = "#10b981" if st == 200 else ("#ef4444" if st and st >= 400 else "#f59e0b")
-        st_txt = st if st else "ERR"
-        extra = ""
-        if "series" in t:
-            extra = f" series={t.get('series',0)} tests={t.get('tests',0)}"
-        tried_html += f'<div class="probe-row"><span class="probe-status" style="color:{color}">{st_txt}</span><span class="probe-path">{esc(t["path"])}{extra}</span></div>'
-
-    series_cards = ""
-    for item in series:
-        access = '✓ Access' if item.get("hasAccess") else ('Free' if item.get("isFree") else 'Paid')
-        access_color = 'green' if item.get("hasAccess") else ('' if item.get("isFree") else 'orange')
-        series_cards += f"""
-        <div class="card">
-          <a href="/series?id={quote(item['id'], safe='')}">
-            <h3>{esc(item['title'])}</h3>
-            <p>Total: {item['totalTests']} · Attempted: {item['attempted']}</p>
-            <span class="badge {access_color}">{access}</span>
-          </a>
-        </div>"""
-
-    test_cards = ""
-    for t in tests[:20]:
-        meta = f"📝 {t['questionCount']} Qs · ⏱ {t['duration']} min"
-        test_cards += f"""
-        <div class="card">
-          <a href="/test?id={quote(t['id'], safe='')}&name={quote(t['title'], safe='')}">
-            <h3>{esc(t['title'])}</h3>
-            <p>{meta}</p>
-            <span class="badge green">Start →</span>
-          </a>
-        </div>"""
-
-    warn = ""
-    if r["hit_429"]:
-        warn = '<div class="warn-box">⚠️ Rate limit hit (429). 1 minute baad dobara try karo, ya DevTools se URL nikaal ke <a href="/dashboard">dashboard</a> pe paste karo.</div>'
-
-    body = f"""<div class="container">
-    <a href="/dashboard" class="back-btn">← Back</a>
-    <div class="info-box"><b>📖 {esc(title)}</b> — exam: <code>{esc(slug)}</code></div>
-    {warn}
-
-    <div class="section-title">📡 Endpoints Tried (sequential)</div>
-    <div style="background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,.05)">
-    {tried_html or '<div class="probe-row">No endpoints tried</div>'}
-    </div>
-
-    {f'<div class="section-title">✅ Found! Series ({len(series)})</div><div class="row">{series_cards}</div>' if series_cards else ''}
-    {f'<div class="section-title">✅ Found! Tests ({len(tests)})</div><div class="row">{test_cards}</div>' if test_cards else ''}
-    {f'<div class="empty"><h2>😕 Kuch nahi mila</h2><p>DevTools method use karo — dashboard pe instructions hain.</p></div>' if not series_cards and not test_cards else ''}
-    </div>"""
-    return HTMLResponse(shell(title, body))
-
 
 @app.get("/try-url", response_class=HTMLResponse)
 async def try_url(url: str = Query(...), session_cookie: Optional[str] = Cookie(None, alias="tb_session")):
     token = get_token(session_cookie)
-    if not token:
-        return RedirectResponse("/", status_code=302)
+    if not token: return RedirectResponse("/", status_code=302)
 
-    # Strip auth_code if present (we'll re-add)
-    if "auth_code=" in url:
-        url = url.split("auth_code=")[0].rstrip("?&")
-    if not url.startswith("http"):
-        return HTMLResponse(shell("Error", '<div class="container"><div class="empty"><h2>URL "https://" se start hona chahiye</h2><a href="/dashboard" class="btn">← Back</a></div></div>'))
-
-    # Enforce API host
-    if "api.testbook.com" not in url:
-        return HTMLResponse(shell("Error", '<div class="container"><div class="empty"><h2>Sirf api.testbook.com allowed</h2><a href="/dashboard" class="btn">← Back</a></div></div>'))
+    if "auth_code=" in url: url = url.split("auth_code=")[0].rstrip("?&")
+    if not url.startswith("http"): return HTMLResponse(shell("Error", '<div class="container"><div class="empty"><h2>URL "https://" se start hona chahiye</h2><a href="/dashboard" class="btn">← Back</a></div></div>'))
+    if "api.testbook.com" not in url: return HTMLResponse(shell("Error", '<div class="container"><div class="empty"><h2>Sirf api.testbook.com allowed</h2><a href="/dashboard" class="btn">← Back</a></div></div>'))
 
     full = f"{url}{'&' if '?' in url else '?'}auth_code={quote(token, safe='')}&language=english"
     async with httpx.AsyncClient(timeout=20.0) as client:
@@ -811,20 +443,12 @@ async def try_url(url: str = Query(...), session_cookie: Optional[str] = Cookie(
         _walk(body_json, series, tests)
         raw_pretty = json.dumps(body_json, indent=2, ensure_ascii=False)[:50000]
     except Exception:
-        body_json = None
-        series, tests = [], []
-        raw_pretty = r.text[:50000]
+        body_json, series, tests, raw_pretty = None, [], [], r.text[:50000]
 
-    series_cards = ""
-    for s in series:
-        series_cards += f'<div class="card"><a href="/series?id={quote(s["id"], safe="")}"><h3>{esc(s["title"])}</h3><p>Total: {s["totalTests"]}</p><span class="badge green">Open →</span></a></div>'
-
-    test_cards = ""
-    for t in tests:
-        test_cards += f'<div class="card"><a href="/test?id={quote(t["id"], safe="")}&name={quote(t["title"], safe="")}"><h3>{esc(t["title"])}</h3><p>📝 {t["questionCount"]} Qs</p><span class="badge green">Start →</span></a></div>'
+    series_cards = "".join([f'<div class="card"><a href="/series?id={quote(s["id"], safe="")}"><h3>{esc(s["title"])}</h3><p>Total Tests: {s["totalTests"]}</p><span class="badge green">Open →</span></a></div>' for s in series])
+    test_cards = "".join([f'<div class="card"><a href="/test?id={quote(t["id"], safe="")}&name={quote(t["title"], safe="")}"><h3>{esc(t["title"])}</h3><p>📝 {t["questionCount"]} Qs</p><span class="badge green">Start →</span></a></div>' for t in tests])
 
     status_color = "#10b981" if status == 200 else "#ef4444"
-    raw_escaped = esc(raw_pretty)
 
     body = f"""<div class="container">
     <a href="/dashboard" class="back-btn">← Back</a>
@@ -834,148 +458,87 @@ async def try_url(url: str = Query(...), session_cookie: Optional[str] = Cookie(
       <div class="stat"><div class="num">{len(series)}</div><div class="lbl">Series</div></div>
       <div class="stat"><div class="num">{len(tests)}</div><div class="lbl">Tests</div></div>
     </div>
-
-    {f'<div class="section-title">✅ Series ({len(series)})</div><div class="row">{series_cards}</div>' if series_cards else ''}
+    {f'<div class="section-title">✅ Real Series ({len(series)})</div><div class="row">{series_cards}</div>' if series_cards else ''}
     {f'<div class="section-title">✅ Tests ({len(tests)})</div><div class="row">{test_cards}</div>' if test_cards else ''}
-
     <div class="section-title">📄 Raw JSON</div>
-    <textarea style="width:100%;min-height:400px;padding:14px;border-radius:10px;border:1.5px solid #e2e8f0;font-family:monospace;font-size:11px;background:#1a202c;color:#a0aec0;resize:vertical">{raw_escaped}</textarea>
+    <textarea style="width:100%;min-height:400px;padding:14px;border-radius:10px;border:1.5px solid #e2e8f0;font-family:monospace;font-size:11px;background:#1a202c;color:#a0aec0;resize:vertical">{esc(raw_pretty)}</textarea>
     </div>"""
     return HTMLResponse(shell("Try URL", body))
-
 
 @app.get("/series", response_class=HTMLResponse)
 async def series_page(id: str = Query(...), session_cookie: Optional[str] = Cookie(None, alias="tb_session")):
     token = get_token(session_cookie)
-    if not token:
-        return RedirectResponse("/", status_code=302)
+    if not token: return RedirectResponse("/", status_code=302)
 
     title = "Test Series"
-    # Try to get series title + tests
+    tests = []
     async with httpx.AsyncClient(timeout=20.0) as client:
-        # Get details
-        for path in [f"/api/v2_1/test-series/{quote(id, safe='')}", f"/api/v2_1/test-series/TS-{quote(id, safe='')}"]:
-            try:
-                full = f"{API_BASE}{path}{'?'}auth_code={quote(token, safe='')}&language=english"
-                r = await cached_get(client, full, tb_headers(token))
-                if r and r.status_code == 200:
-                    j = r.json()
-                    if j.get("success"):
-                        d = j.get("data", {})
-                        title = _clean_text(d.get("details", {}).get("name") or d.get("name") or title)
-                        break
-            except Exception:
-                continue
-
-        # Get tests via live-panel/all?tsid=
-        tests = []
+        # Fetch series tests
         for path in [f"/api/v2_1/live-panel/all?tsid={quote(id, safe='')}", f"/api/v2_1/live-panel/all?tsid=TS-{quote(id, safe='')}"]:
-            try:
-                full = f"{API_BASE}{path}{'&'}auth_code={quote(token, safe='')}&language=english"
-                r = await cached_get(client, full, tb_headers(token))
-                if r and r.status_code == 200:
-                    j = r.json()
-                    if j.get("success"):
-                        s_list, t_list = [], []
-                        _walk(j.get("data", {}), s_list, t_list)
-                        if t_list:
-                            tests = t_list
-                            break
-            except Exception:
-                continue
+            full = f"{API_BASE}{path}&auth_code={quote(token, safe='')}&language=english"
+            r = await cached_get(client, full, tb_headers(token))
+            if r and r.status_code == 200:
+                j = r.json()
+                if j.get("success"):
+                    s, t = [], []
+                    _walk(j.get("data", {}), s, t)
+                    if t:
+                        tests = t
+                        if s and s[0].get("title"): title = s[0]["title"]
+                        break
 
-    test_cards = ""
-    for t in tests:
-        meta = f"📝 {t['questionCount']} Qs · ⏱ {t['duration']} min"
-        test_cards += f"""
-        <div class="card">
-          <a href="/test?id={quote(t['id'], safe='')}&name={quote(t['title'], safe='')}">
-            <h3>{esc(t['title'])}</h3>
-            <p>{meta}</p>
-            <span class="badge green">Start →</span>
-          </a>
-        </div>"""
+    test_cards = "".join([f'<div class="card"><a href="/test?id={quote(t["id"], safe="")}&name={quote(t["title"], safe="")}"><h3>{esc(t["title"])}</h3><p>📝 {t["questionCount"]} Qs · ⏱ {t["duration"]} min</p><span class="badge green">Start →</span></a></div>' for t in tests])
 
     body = f"""<div class="container">
     <a href="/dashboard" class="back-btn">← Back</a>
-    <div class="info-box"><b>📚 {esc(title)}</b><br>Series ID: <code>{esc(id)}</code></div>
-
-    {f'<div class="section-title">📝 Tests ({len(tests)})</div><div class="row">{test_cards}</div>' if test_cards else '<div class="empty"><h2>Tests load nahi hue</h2><p>DevTools se check karo kaunsa endpoint tests deta hai.</p></div>'}
+    <div class="info-box"><b>📚 {esc(title)}</b></div>
+    {f'<div class="section-title">📝 Tests ({len(tests)})</div><div class="row">{test_cards}</div>' if test_cards else '<div class="empty"><h2>Tests load nahi hue</h2><p>Is series me direct tests nahi mile.</p></div>'}
     </div>"""
     return HTMLResponse(shell(title, body))
 
-
 @app.get("/test", response_class=HTMLResponse)
-async def test_page(id: str = Query(...), name: str = Query(""),
-                    session_cookie: Optional[str] = Cookie(None, alias="tb_session")):
+async def test_page(id: str = Query(...), name: str = Query(""), session_cookie: Optional[str] = Cookie(None, alias="tb_session")):
     token = get_token(session_cookie)
-    if not token:
-        return RedirectResponse("/", status_code=302)
-    title = name or "Test"
-    body = f"""<div id="loading" class="loading-box">
-      <div class="spinner"></div>
-      <p>Questions load ho rahe hain (sequential try)...</p>
-    </div>
-    <div id="quiz"></div>
+    if not token: return RedirectResponse("/", status_code=302)
+    
+    body = f"""<div id="loading" class="loading-box"><div class="spinner"></div><p>Questions load ho rahe hain...</p></div><div id="quiz"></div>
     <script>
-      fetch('/api/test-questions?id=' + encodeURIComponent({json.dumps(id)}))
-        .then(r => r.json())
-        .then(data => {{
-          document.getElementById('loading').style.display = 'none';
-          const box = document.getElementById('quiz');
-          if (!data.questions || data.questions.length === 0) {{
-            box.innerHTML = '<div class="container"><div class="empty"><h2>😕 Questions load nahi hue</h2>' +
-              '<p style="font-size:12px">' + esc(data.error || 'unknown') + '</p>' +
-              '<p style="font-size:11px;color:#a0aec0;margin-top:8px">Tried: ' + (data.tried || []).map(t => t.path + '→' + t.status).join(', ') + '</p>' +
-              '<a href="/dashboard" class="btn" style="margin-top:16px">← Back</a></div></div>';
-            return;
-          }}
-          renderQuiz(data.questions, data.test_info || {{}});
-        }});
-
+      fetch('/api/test-questions?id=' + encodeURIComponent({json.dumps(id)})).then(r => r.json()).then(data => {{
+        document.getElementById('loading').style.display = 'none';
+        const box = document.getElementById('quiz');
+        if (!data.questions || data.questions.length === 0) {{
+          box.innerHTML = '<div class="container"><div class="empty"><h2>😕 Questions load nahi hue</h2><p style="font-size:12px">' + esc(data.error || '') + '</p><a href="/dashboard" class="btn" style="margin-top:16px">← Back</a></div></div>';
+          return;
+        }}
+        renderQuiz(data.questions, data.test_info || {{}});
+      }});
       function renderQuiz(questions, info) {{
-        window.__answers = {{}};
-        window.__questions = questions;
-        window.__current = 0;
-        window.__lang = 'en';
-        window.__timeLeft = (info.duration || 30) * 60;
-        window.__timerInterval = null;
-
-        let html = '<div class="container" style="padding:0;max-width:100%">';
-        html += '<div class="tb-header"><span class="q-num-big" id="qNum">1.</span>';
-        html += '<div class="q-stats"><span class="lbl">Marks</span><span class="val" id="qMarks"></span></div>';
-        html += '<div class="timer-box" id="mainTimer">--:--</div>';
-        html += '<select class="lang-select" onchange="switchLang(this.value)"><option value="en">English</option><option value="hi">हिंदी</option></select>';
-        html += '</div>';
-        html += '<div class="q-indicators" id="indicators"></div>';
-        html += '<div class="tb-question" id="questionArea"></div>';
-        html += '<div class="tb-nav">';
-        html += '<button class="btn-clear" onclick="clearResponse()">Clear</button>';
-        html += '<button class="btn-prev" onclick="prevQuestion()">← Prev</button>';
-        html += '<button class="btn-save" onclick="saveAndNext()">Save & Next →</button>';
-        html += '<button class="btn-submit" onclick="submitQuiz()">Submit</button>';
-        html += '</div></div>';
+        window.__answers = {{}}; window.__questions = questions; window.__current = 0; window.__lang = 'en'; window.__timeLeft = (info.duration || 30) * 60;
+        let html = '<div class="container" style="padding:0;max-width:100%"><div class="tb-header"><span class="q-num-big" id="qNum">1.</span>';
+        html += '<div class="q-stats"><span class="lbl">Marks</span><span class="val" id="qMarks"></span></div><div class="timer-box" id="mainTimer">--:--</div>';
+        html += '<select class="lang-select" onchange="switchLang(this.value)"><option value="en">English</option><option value="hi">हिंदी</option></select></div>';
+        html += '<div class="q-indicators" id="indicators"></div><div class="tb-question" id="questionArea"></div>';
+        html += '<div class="tb-nav"><button class="btn-clear" onclick="clearResponse()">Clear</button><button class="btn-prev" onclick="prevQuestion()">← Prev</button>';
+        html += '<button class="btn-save" onclick="saveAndNext()">Save & Next →</button><button class="btn-submit" onclick="submitQuiz()">Submit</button></div></div>';
         document.getElementById('quiz').innerHTML = html;
         renderCurrentQuestion();
-        startTimer();
+        window.__timerInterval = setInterval(() => {{ if(window.__timeLeft<=0){clearInterval(window.__timerInterval);submitQuiz();return;} window.__timeLeft--; updateTimerDisplay(); }}, 1000);
       }}
-
+      function updateTimerDisplay() {{
+        const t = window.__timeLeft, h = Math.floor(t/3600), m = Math.floor((t%3600)/60), s = t%60, pad = n => String(n).padStart(2,'0');
+        document.getElementById('mainTimer').textContent = (h>0?pad(h)+':':'') + pad(m)+':'+pad(s);
+      }}
       function renderCurrentQuestion() {{
-        const q = window.__questions[window.__current];
-        const lang = window.__lang;
+        const q = window.__questions[window.__current], lang = window.__lang;
         const qText = (lang === 'hi' && q.text_hi) ? q.text_hi : (q.text_en || q.text);
         const qOpts = (lang === 'hi' && q.options_hi && q.options_hi.length) ? q.options_hi : (q.options_en || q.options);
         document.getElementById('qNum').textContent = (window.__current + 1) + '.';
         document.getElementById('qMarks').innerHTML = '<span style="color:#10b981">+' + (q.posMarks||4) + '</span> / <span style="color:#ef4444">-' + (q.negMarks||1) + '</span>';
         let html = '<div class="q-text">' + esc(qText) + '</div>';
-        qOpts.forEach((opt, j) => {{
-          const sel = window.__answers[window.__current] === j ? 'selected' : '';
-          html += '<div class="tb-opt ' + sel + '" data-opt="' + j + '" onclick="pickOption(' + j + ')"><div class="radio"></div><div>' + esc(opt) + '</div></div>';
-        }});
+        qOpts.forEach((opt, j) => {{ html += '<div class="tb-opt ' + (window.__answers[window.__current]===j?'selected':'') + '" onclick="pickOption(' + j + ')"><div class="radio"></div><div>' + esc(opt) + '</div></div>'; }});
         document.getElementById('questionArea').innerHTML = html;
         renderIndicators();
       }}
-
       function renderIndicators() {{
         let html = '';
         for (let i = 0; i < window.__questions.length; i++) {{
@@ -984,117 +547,112 @@ async def test_page(id: str = Query(...), name: str = Query(""),
         }}
         document.getElementById('indicators').innerHTML = html;
       }}
-
       function pickOption(j) {{ window.__answers[window.__current] = j; renderCurrentQuestion(); }}
       function clearResponse() {{ delete window.__answers[window.__current]; renderCurrentQuestion(); }}
-      function saveAndNext() {{ if (window.__current < window.__questions.length - 1) {{ window.__current++; renderCurrentQuestion(); window.scrollTo({{top:0,behavior:'smooth'}}); }} }}
-      function prevQuestion() {{ if (window.__current > 0) {{ window.__current--; renderCurrentQuestion(); window.scrollTo({{top:0,behavior:'smooth'}}); }} }}
-      function jumpTo(i) {{ window.__current = i; renderCurrentQuestion(); window.scrollTo({{top:0,behavior:'smooth'}}); }}
+      function saveAndNext() {{ if (window.__current < window.__questions.length - 1) {{ window.__current++; renderCurrentQuestion(); }} }}
+      function prevQuestion() {{ if (window.__current > 0) {{ window.__current--; renderCurrentQuestion(); }} }}
+      function jumpTo(i) {{ window.__current = i; renderCurrentQuestion(); }}
       function switchLang(l) {{ window.__lang = l; renderCurrentQuestion(); }}
-
-      function startTimer() {{
-        updateTimerDisplay();
-        window.__timerInterval = setInterval(() => {{
-          if (window.__timeLeft <= 0) {{ clearInterval(window.__timerInterval); submitQuiz(); return; }}
-          window.__timeLeft--; updateTimerDisplay();
-        }}, 1000);
-      }}
-
-      function updateTimerDisplay() {{
-        const t = window.__timeLeft;
-        const h = Math.floor(t/3600), m = Math.floor((t%3600)/60), s = t%60;
-        const pad = n => String(n).padStart(2,'0');
-        document.getElementById('mainTimer').textContent = (h>0?pad(h)+':':'') + pad(m)+':'+pad(s);
-      }}
-
       function submitQuiz() {{
-        if (!confirm('Submit?')) return;
-        if (window.__timerInterval) clearInterval(window.__timerInterval);
-        const answers = window.__answers || {{}}, questions = window.__questions || [];
-        let attempted = Object.keys(answers).length;
-        let correct = 0, scoreable = 0;
-        questions.forEach((q, i) => {{
-          if (q.correctIndex >= 0) {{ scoreable++; if (answers[i] === q.correctIndex) correct++; }}
-        }});
-        const rb = document.createElement('div');
-        rb.className = 'result-box';
-        if (scoreable === 0) {{
-          rb.innerHTML = '<div class="score">' + attempted + ' / ' + questions.length + '</div><div>Attempted</div><button class="btn" style="background:#fff;color:#4f46e5;margin-top:16px" onclick="window.location.reload()">🔄 Retake</button>';
-        }} else {{
-          rb.innerHTML = '<div class="score">' + correct + ' / ' + questions.length + '</div><div>Attempted: ' + attempted + ' · Correct: ' + correct + '</div><button class="btn" style="background:#fff;color:#4f46e5;margin-top:16px" onclick="window.location.reload()">🔄 Retake</button>';
-        }}
-        document.getElementById('quiz').innerHTML = '';
-        document.getElementById('quiz').appendChild(rb);
+        if (!confirm('Submit?')) return; clearInterval(window.__timerInterval);
+        const ans = window.__answers, qs = window.__questions; let att = Object.keys(ans).length, corr = 0, scoreable = 0;
+        qs.forEach((q, i) => {{ if (q.correctIndex >= 0) { scoreable++; if (ans[i] === q.correctIndex) corr++; } }});
+        let res = '<div class="result-box">';
+        if (scoreable === 0) res += '<div class="score">' + att + ' / ' + qs.length + '</div><div>Attempted</div>';
+        else res += '<div class="score">' + corr + ' / ' + qs.length + '</div><div>Attempted: ' + att + ' · Correct: ' + corr + '</div>';
+        res += '<button class="btn" style="background:#fff;color:#4f46e5;margin-top:16px" onclick="window.location.reload()">🔄 Retake</button></div>';
+        document.getElementById('quiz').innerHTML = res;
       }}
-
-      function esc(s) {{
-        if (s == null) return '';
-        return String(s).replace(/[&<>"']/g, c => ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]));
-      }}
+      function esc(s) {{ if (s == null) return ''; return String(s).replace(/[&<>"']/g, c => ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c])); }}
     </script>"""
-    return HTMLResponse(shell(title, body))
-
+    return HTMLResponse(shell(name or "Test", body))
 
 @app.get("/api/test-questions")
-async def api_test_questions(id: str = Query(...),
-                             session_cookie: Optional[str] = Cookie(None, alias="tb_session")):
+async def api_test_questions(id: str = Query(...), session_cookie: Optional[str] = Cookie(None, alias="tb_session")):
     token = get_token(session_cookie)
-    if not token:
-        return JSONResponse({"error": "not logged in", "questions": []}, status_code=401)
-    try:
-        result = await asyncio.wait_for(fetch_test_questions(token, id), timeout=60.0)
-        return {"questions": result["questions"], "count": len(result["questions"]),
-                "test_info": result.get("test_info"), "error": result.get("error"),
-                "tried": result.get("tried", [])}
-    except Exception as e:
-        return {"questions": [], "error": str(e), "tried": []}
+    if not token: return JSONResponse({"error": "not logged in", "questions": []}, status_code=401)
+    
+    candidates = [
+        f"/api/v2_1/tests/{quote(id, safe='')}",
+        f"/api/v2_1/tests/{quote(id, safe='')}?attemptNo=1",
+        f"/api/v2_1/test/{quote(id, safe='')}",
+    ]
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        for path in candidates:
+            full = f"{API_BASE}{path}{'&' if '?' in path else '?'}auth_code={quote(token, safe='')}&language=english"
+            r = await rate_limited_get(client, full, tb_headers(token))
+            if r and r.status_code == 200:
+                j = r.json()
+                if j.get("success"):
+                    data = j.get("data", {})
+                    qs = extract_questions(data)
+                    if qs:
+                        dur = data.get("duration") or 0
+                        if dur > 1000: dur = dur // 60
+                        return {"questions": qs, "count": len(qs), "test_info": {"title": _clean_text(data.get("title") or "Test"), "duration": dur}}
+    return {"questions": [], "error": "Questions API endpoint se nahi mile."}
 
+# ============================================================
+# 🐛 RAW DATA & DOWNLOAD (Wapas laga diya)
+# ============================================================
 
-# ---------- RAW ----------
 @app.get("/raw", response_class=HTMLResponse)
-async def raw_page(custom: Optional[str] = Query(None),
-                   session_cookie: Optional[str] = Cookie(None, alias="tb_session")):
+async def raw_page(session_cookie: Optional[str] = Cookie(None, alias="tb_session")):
     token = get_token(session_cookie)
-    if not token:
-        return RedirectResponse("/", status_code=302)
+    if not token: return RedirectResponse("/", status_code=302)
 
     user = get_user_info(token)
-
-    if custom:
-        return RedirectResponse(f"/try-url?url={quote(custom, safe='')}", status_code=302)
-
     body = f"""<div class="container">
-    <a href="/dashboard" class="back-btn">← Dashboard</a>
+    <a href="/dashboard" class="back-btn">← Back</a>
     <div class="info-box">
-      <b>🐛 Raw URL Tester</b><br>
+      <b>🐛 Raw Data Viewer</b><br>
       User: {esc(user['name'])} · isPaid: {user['isPaid']}
     </div>
 
-    <div class="section-title">📡 Custom URL Test</div>
+    <div class="section-title">📡 Custom URL Fetch</div>
     <form class="search-box" method="get" action="/try-url">
       <input type="text" name="url" placeholder="https://api.testbook.com/api/v2_1/..." required>
-      <button type="submit">Test →</button>
+      <button type="submit">Fetch →</button>
     </form>
 
-    <div class="warn-box">
-      <b>⚠️ Rate limit:</b> Testbook 429 kuch hi requests me de deta hai.
-      Sequential + cache system active hai. Agar 429 aaye to 1 min rukо.
-    </div>
-
-    <div class="section-title">💡 Suggested URLs (one by one try karo)</div>
-    <p style="font-size:12px;color:#718096;margin-bottom:10px">
-      Neeche se koi ek click karo → result dekho. Jo <span class="badge green">series/tests</span> de, wahi correct endpoint hai.
-    </p>
-    <div>
-      <a class="slug-chip" href="/try-url?url=https://api.testbook.com/api/v2_1/test-series/TS-ssc-mts">TS-ssc-mts</a>
-      <a class="slug-chip" href="/try-url?url=https://api.testbook.com/api/v2_1/test-series?exam=ssc-mts">test-series?exam=ssc-mts</a>
-      <a class="slug-chip" href="/try-url?url=https://api.testbook.com/api/v2_1/live-panel/all?tsid=TS-ssc-mts">live-panel TS-ssc-mts</a>
-      <a class="slug-chip" href="/try-url?url=https://api.testbook.com/api/v2_1/live-panel/all">live-panel/all</a>
-      <a class="slug-chip" href="/try-url?url=https://api.testbook.com/api/v2_1/live-panel/count">live-panel/count</a>
-    </div>
+    <div class="section-title">📥 Download Full Raw Dump</div>
+    <p style="font-size:12px;color:#718096;margin-bottom:12px">Testbook ke saare known endpoints ka data ek sath download karo (JSON format).</p>
+    <a href="/raw/full" class="btn" style="background:#10b981">📥 Download Raw JSON</a>
     </div>"""
-    return HTMLResponse(shell("Raw", body))
+    return HTMLResponse(shell("Raw Data", body))
 
+@app.get("/raw/full")
+async def raw_full(session_cookie: Optional[str] = Cookie(None, alias="tb_session")):
+    token = get_token(session_cookie)
+    if not token: return RedirectResponse("/", status_code=302)
+
+    user = get_user_info(token)
+    endpoints = [
+        "/api/v2_1/live-panel/all",
+        "/api/v2_1/live-panel/count",
+        f"/api/v2_1/test-series?exam=ssc-mts",
+        f"/api/v2_1/test-series/TS-ssc-mts",
+        f"/api/v2_1/users/{user['userId']}/test-series"
+    ]
+    
+    results = []
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        for ep in endpoints:
+            full = f"{API_BASE}{ep}{'&' if '?' in ep else '?'}auth_code={quote(token, safe='')}&language=english"
+            r = await rate_limited_get(client, full, tb_headers(token))
+            if r:
+                try: body = r.json()
+                except: body = r.text[:1000]
+                results.append({"endpoint": ep, "status": r.status_code, "data": body})
+            else:
+                results.append({"endpoint": ep, "status": None, "data": "Error"})
+
+    payload = {
+        "generated_at": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
+        "user": user,
+        "results": results
+    }
+    return JSONResponse(payload, headers={"Content-Disposition": 'attachment; filename="testbook_raw_dump.json"'})
 
 if __name__ == "__main__":
     import uvicorn

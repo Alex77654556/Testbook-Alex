@@ -15,7 +15,8 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from typing import Optional, List, Dict, Any
 from urllib.parse import quote
 
-app = FastAPI(title="Testbook Mirror", version="37.0.0", docs_url=None, redoc_url=None, openapi_url=None)
+app = FastAPI(title="Testbook Mirror", version="38.0.0",
+              docs_url=None, redoc_url=None, openapi_url=None)
 
 BASE_URL = "https://testbook.com"
 API_BASE = "https://api.testbook.com"
@@ -28,7 +29,7 @@ ALL_API = f"{API_BASE}/api/v2_1/live-panel/all"
 SERIES_LIST_API = f"{API_BASE}/api/v2_1/test-series"
 
 
-# ---------- HTML escape helper ----------
+# ---------- HTML escape ----------
 def esc(s) -> str:
     if s is None:
         return ""
@@ -133,63 +134,69 @@ def _clean_text(s) -> str:
     except Exception:
         pass
     s = s.replace("\u00a0", " ").replace("\t", " ")
-    s = " ".join(s.split())
-    return s.strip()
+    return " ".join(s.split()).strip()
 
 
-# ---------- Enrolled / Recent endpoints (expanded) ----------
-ENROLLED_ENDPOINTS = [
-    # live-panel family
-    f"{API_BASE}/api/v2_1/live-panel/all",
-    f"{API_BASE}/api/v2_1/live-panel/my-series",
-    f"{API_BASE}/api/v2_1/live-panel/enrolled",
-    f"{API_BASE}/api/v2_1/live-panel/enrolled-test-series",
-    f"{API_BASE}/api/v2_1/live-panel/recent-test-series",
-    f"{API_BASE}/api/v2_1/live-panel/recent",
-    f"{API_BASE}/api/v2_1/live-panel/home",
-    f"{API_BASE}/api/v2_1/live-panel/dashboard",
-    f"{API_BASE}/api/v2_1/live-panel/panel",
-    f"{API_BASE}/api/v2_1/live-panel/panel-data",
-    f"{API_BASE}/api/v2_1/live-panel/series",
-    f"{API_BASE}/api/v2_1/live-panel/test-series",
-    f"{API_BASE}/api/v2_1/live-panel/live-tests",
-    f"{API_BASE}/api/v2_1/live-panel/free-quizzes",
-    f"{API_BASE}/api/v2_1/live-panel/quiz",
-    f"{API_BASE}/api/v2_1/live-panel/quizzes",
-    # user-based
-    f"{API_BASE}/api/v2_1/me/test-series",
-    f"{API_BASE}/api/v2_1/me/enrolled",
-    f"{API_BASE}/api/v2_1/me/dashboard",
-    f"{API_BASE}/api/v2_1/me/purchases",
-    f"{API_BASE}/api/v2_1/me/library",
-    f"{API_BASE}/api/v2_1/users/me/test-series",
-    f"{API_BASE}/api/v2_1/users/me/enrolled",
-    f"{API_BASE}/api/v2_1/users/me/purchases",
-    f"{API_BASE}/api/v2_1/users/me/library",
-    f"{API_BASE}/api/v2_1/users/me/home",
-    f"{API_BASE}/api/v2_1/users/me/dashboard",
-    f"{API_BASE}/api/v2_1/user/enrolled-test-series",
-    f"{API_BASE}/api/v2_1/user/my-test-series",
-    f"{API_BASE}/api/v2_1/user/purchases",
-    # library / purchases
-    f"{API_BASE}/api/v2_1/purchases",
-    f"{API_BASE}/api/v2_1/my-library",
-    f"{API_BASE}/api/v2_1/library",
-    f"{API_BASE}/api/v2_1/test-series/enrolled",
-    f"{API_BASE}/api/v2_1/test-series/mine",
-    f"{API_BASE}/api/v2_1/enrolled",
-    # v2
-    f"{API_BASE}/api/v2/me/test-series",
-    f"{API_BASE}/api/v2/users/me/test-series",
-    f"{API_BASE}/api/v2/live-panel/all",
-    f"{API_BASE}/api/v2/users/me/purchases",
-    # v3
-    f"{API_BASE}/api/v3/me/test-series",
-    f"{API_BASE}/api/v3/live-panel/all",
+# ---------- 🆕 Exam slug registry ----------
+COMMON_EXAM_SLUGS = [
+    "ssc-mts", "ssc-cgl", "ssc-chsl", "ssc-gd", "ssc-cpo", "ssc-stenographer",
+    "rrb-group-d", "rrb-ntpc", "rrb-alp", "rrb-je",
+    "bihar-police-si", "bihar-police-constable", "bssc-inter-level", "bssc-cgl",
+    "up-police", "upsssc-pet", "ibps-po", "ibps-clerk", "sbi-po", "sbi-clerk",
+    "rrb-group-d", "uppsc", "bpsc", "railway-group-d",
 ]
 
 
-# ---------- ✅ FIXED Series / Test extraction (handles nested details) ----------
+def title_to_slug(title: str) -> str:
+    """Convert exam title to slug: 'SSC MTS' -> 'ssc-mts'"""
+    if not title:
+        return ""
+    s = title.lower().strip()
+    s = s.replace("&", "and").replace(".", "").replace(",", "")
+    s = "-".join(s.split())
+    import re
+    s = re.sub(r"[^a-z0-9\-]", "", s)
+    s = re.sub(r"-+", "-", s).strip("-")
+    return s
+
+
+async def discover_exam_slugs(token: str) -> List[str]:
+    """Auto-discover exam slugs from user's JWT + live-panel."""
+    slugs = set()
+    user = get_user_info(token)
+    payload = decode_jwt_payload(token) or {}
+
+    # From JWT targets
+    for t in (payload.get("targets") or []):
+        if isinstance(t, dict):
+            t_slug = t.get("slug") or title_to_slug(t.get("title", ""))
+            if t_slug:
+                slugs.add(t_slug)
+
+    # From live-panel specificExams
+    try:
+        url = f"{ALL_API}?auth_code={quote(token, safe='')}&language=english"
+        async with httpx.AsyncClient(timeout=8.0) as c:
+            r = await c.get(url, headers=tb_headers(token))
+            if r.status_code == 200:
+                j = r.json()
+                data = j.get("data", {})
+                for lt in (data.get("liveTests") or []):
+                    for ex in (lt.get("specificExams") or []):
+                        s = title_to_slug(ex.get("title", ""))
+                        if s and len(s) > 2:
+                            slugs.add(s)
+    except Exception:
+        pass
+
+    # Add common slugs as fallback
+    for s in COMMON_EXAM_SLUGS:
+        slugs.add(s)
+
+    return list(slugs)
+
+
+# ---------- 🆕 Fetch series for an exam ----------
 def _extract_series_from_obj(obj):
     if not isinstance(obj, dict):
         return None
@@ -212,12 +219,17 @@ def _extract_series_from_obj(obj):
 
     keys = set(obj.keys()) | set(details.keys())
     if keys & {"questionCount", "totalQuestions", "testType", "posMarks"} and "details" not in obj:
-        return None  # it's a test, not a series
+        return None
 
     attempted = (prog.get("attempted") or prog.get("testsAttempted")
                  or obj.get("attempted") or obj.get("testsAttempted") or 0)
     total = (prog.get("total") or prog.get("totalTests")
              or obj.get("totalTests") or obj.get("testCount") or 0)
+
+    has_access = bool(obj.get("hasAccess") or details.get("hasAccess")
+                     or obj.get("isPurchased") or details.get("isPurchased"))
+    purchase_info = obj.get("purchaseInfo") or details.get("purchaseInfo") or []
+    is_free = any(isinstance(p, dict) and p.get("type") == "Free" for p in purchase_info)
 
     return {
         "id": str(sid),
@@ -225,6 +237,8 @@ def _extract_series_from_obj(obj):
         "description": _clean_text(str(obj.get("description") or details.get("description") or ""))[:150],
         "totalTests": int(total) if isinstance(total, (int, float)) else 0,
         "attempted": int(attempted) if isinstance(attempted, (int, float)) else 0,
+        "hasAccess": has_access,
+        "isFree": is_free,
     }
 
 
@@ -269,7 +283,63 @@ def _walk(node, out_series, out_tests, depth=0):
                 _walk(v, out_series, out_tests, depth + 1)
 
 
+async def fetch_series_for_exam(token: str, exam_slug: str) -> Dict:
+    """Fetch ALL test series for a given exam slug. Tries multiple patterns."""
+    user = get_user_info(token)
+    uid = user.get("userId", "")
+
+    patterns = [
+        f"{API_BASE}/api/v2_1/test-series?exam={quote(exam_slug, safe='')}",
+        f"{API_BASE}/api/v2_1/test-series?exam={quote(exam_slug, safe='')}&my=true",
+        f"{API_BASE}/api/v2_1/test-series/my?exam={quote(exam_slug, safe='')}",
+        f"{API_BASE}/api/v2_1/test-series?exam={quote(exam_slug, safe='')}&filter=my",
+        f"{API_BASE}/api/v2_1/test-series?exam={quote(exam_slug, safe='')}&enrolled=true",
+        f"{API_BASE}/api/v2_1/test-series?exam={quote(exam_slug, safe='')}&purchased=true",
+    ]
+    if uid:
+        patterns += [
+            f"{API_BASE}/api/v2_1/users/{uid}/test-series?exam={quote(exam_slug, safe='')}",
+            f"{API_BASE}/api/v2_1/exams/{quote(exam_slug, safe='')}/test-series/my",
+        ]
+
+    result = {"series": [], "tests": [], "hits": [], "errors": []}
+
+    async with httpx.AsyncClient(follow_redirects=True, timeout=12.0) as client:
+        async def try_one(u):
+            full = f"{u}{'&' if '?' in u else '?'}auth_code={quote(token, safe='')}&language=english"
+            try:
+                r = await client.get(full, headers=tb_headers(token))
+                if r.status_code != 200:
+                    return None
+                j = r.json()
+                if not isinstance(j, dict) or not j.get("success"):
+                    return None
+                return {"url": u, "data": j.get("data", {})}
+            except Exception:
+                return None
+
+        results = await asyncio.gather(*[try_one(u) for u in patterns], return_exceptions=True)
+
+        seen_ids = set()
+        for res in results:
+            if isinstance(res, Exception) or res is None:
+                continue
+            series_list, tests_list = [], []
+            _walk(res["data"], series_list, tests_list)
+            if series_list or tests_list:
+                result["hits"].append({"url": res["url"], "series": len(series_list), "tests": len(tests_list)})
+            for s in series_list:
+                if s["id"] not in seen_ids:
+                    seen_ids.add(s["id"])
+                    result["series"].append(s)
+            for t in tests_list:
+                result["tests"].append(t)
+
+    return result
+
+
 async def fetch_enrolled_and_recent(token: str) -> Dict:
+    """Try many endpoints for enrolled series + live tests."""
     result = {"enrolled_series": [], "live_tests": [], "endpoint_hits": [], "errors": []}
     seen_series_ids = set()
     seen_test_ids = set()
@@ -288,7 +358,11 @@ async def fetch_enrolled_and_recent(token: str) -> Dict:
             except Exception:
                 return None
 
-        tasks = [try_endpoint(u) for u in ENROLLED_ENDPOINTS]
+        endpoints = [
+            f"{API_BASE}/api/v2_1/live-panel/all",
+            f"{API_BASE}/api/v2_1/live-panel/count",
+        ]
+        tasks = [try_endpoint(u) for u in endpoints]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         for res in results:
@@ -298,51 +372,18 @@ async def fetch_enrolled_and_recent(token: str) -> Dict:
             _walk(res["data"], series_list, tests_list)
             if series_list or tests_list:
                 result["endpoint_hits"].append({
-                    "url": res["url"],
-                    "series_count": len(series_list),
-                    "tests_count": len(tests_list),
+                    "url": res["url"], "series_count": len(series_list), "tests_count": len(tests_list),
                 })
             for s in series_list:
-                if s["id"] and s["id"] not in seen_series_ids:
+                if s["id"] not in seen_series_ids:
                     seen_series_ids.add(s["id"])
                     result["enrolled_series"].append(s)
             for t in tests_list:
-                if t["id"] and t["id"] not in seen_test_ids:
+                if t["id"] not in seen_test_ids:
                     seen_test_ids.add(t["id"])
                     result["live_tests"].append(t)
 
     return result
-
-
-# ---------- Fallback: series via test-series API ----------
-async def fetch_series_list(token: str, exam_slug: str = "rrb-group-d") -> List[Dict]:
-    url = f"{SERIES_LIST_API}?exam={quote(exam_slug, safe='')}&auth_code={quote(token, safe='')}&language=english"
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            r = await client.get(url, headers=tb_headers(token))
-            if r.status_code != 200:
-                return []
-            j = r.json()
-            if not j.get("success"):
-                return []
-            ts = j.get("data", {}).get("testSeries", [])
-            results = []
-            for item in ts:
-                d = item.get("details", {}) if isinstance(item, dict) else {}
-                sid = str(d.get("id") or "")
-                if not sid:
-                    continue
-                results.append({
-                    "id": sid,
-                    "slug": str(d.get("slug") or ""),
-                    "title": _clean_text(d.get("name") or "Test Series"),
-                    "description": _clean_text(str(d.get("description") or ""))[:150],
-                    "totalTests": 0,
-                    "attempted": 0,
-                })
-            return results
-    except Exception:
-        return []
 
 
 # ---------- Tests for a series ----------
@@ -449,33 +490,54 @@ def extract_questions_from_test_detail(data: dict) -> List[Dict]:
 
 
 async def fetch_test_questions(token: str, test_id: str) -> Dict:
+    """Try multiple endpoint patterns for test questions."""
     s = quote(test_id, safe="")
-    url = f"{API_BASE}/api/v2_1/tests/{s}?auth_code={quote(token, safe='')}&language=english"
-    result = {"questions": [], "test_info": None, "error": None}
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            r = await client.get(url, headers=tb_headers(token))
-            if r.status_code != 200:
-                result["error"] = f"HTTP {r.status_code}"
-                return result
-            j = r.json()
-            if not j.get("success"):
-                result["error"] = "success=false"
-                return result
-            data = j.get("data", {})
-            dur = data.get("duration") or 0
-            if dur > 1000:
-                dur = dur // 60
-            result["test_info"] = {
-                "title": _clean_text(data.get("title") or "Test"),
-                "duration": dur,
-                "totalQuestions": sum(len(s.get("questions", [])) for s in data.get("sections", [])),
-            }
-            result["questions"] = extract_questions_from_test_detail(data)
-            return result
-    except Exception as e:
-        result["error"] = str(e)
-        return result
+    patterns = [
+        f"{API_BASE}/api/v2_1/tests/{s}",
+        f"{API_BASE}/api/v2_1/tests/{s}?attemptNo=1",
+        f"{API_BASE}/api/v2_1/tests/{s}/detail",
+        f"{API_BASE}/api/v2_1/tests/{s}/questions",
+        f"{API_BASE}/api/v2_1/test/{s}",
+        f"{API_BASE}/api/v2_1/tests/{s}/start",
+    ]
+
+    result = {"questions": [], "test_info": None, "error": None, "endpoint_used": None}
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        for u in patterns:
+            full = f"{u}{'&' if '?' in u else '?'}auth_code={quote(token, safe='')}&language=english"
+            try:
+                r = await client.get(full, headers=tb_headers(token))
+                if r.status_code != 200:
+                    continue
+                j = r.json()
+                if not j.get("success"):
+                    continue
+                data = j.get("data", {})
+                qs = extract_questions_from_test_detail(data)
+                if not qs:
+                    # Try other shapes
+                    for key in ("questions", "testQuestions"):
+                        if isinstance(data.get(key), list):
+                            qs = extract_questions_from_test_detail({"sections": [{"questions": data[key]}]})
+                            break
+                if qs:
+                    dur = data.get("duration") or 0
+                    if dur > 1000:
+                        dur = dur // 60
+                    result["test_info"] = {
+                        "title": _clean_text(data.get("title") or "Test"),
+                        "duration": dur,
+                        "totalQuestions": len(qs),
+                    }
+                    result["questions"] = qs
+                    result["endpoint_used"] = u
+                    return result
+            except Exception:
+                continue
+
+    result["error"] = "All test-question endpoints failed"
+    return result
 
 
 # ---------- Error handlers ----------
@@ -488,7 +550,7 @@ async def http_exc(request: Request, exc: StarletteHTTPException):
 async def all_exc(request: Request, exc: Exception):
     import traceback
     print("ERROR:", traceback.format_exc())
-    return HTMLResponse("<h1>Error</h1><p>Kuch galat ho gaya. Developer ko /raw ka dump bhejo.</p>", status_code=500)
+    return HTMLResponse("<h1>Error</h1><p>Kuch galat ho gaya. /raw dump bhejo.</p>", status_code=500)
 
 
 # ---------- CSS ----------
@@ -518,6 +580,7 @@ font-weight:700;padding:3px 9px;border-radius:12px;margin-top:8px;
 text-transform:uppercase;letter-spacing:.3px}
 .badge.green{background:#d1fae5;color:#059669}
 .badge.orange{background:#fed7aa;color:#c2410c}
+.badge.red{background:#fee2e2;color:#dc2626}
 .row{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px}
 .series-card{background:#fff;border-radius:14px;padding:16px;box-shadow:0 2px 10px rgba(0,0,0,.06);
 border-left:4px solid #1fbad6}
@@ -608,6 +671,11 @@ font-size:11px;font-weight:700;margin:2px;cursor:pointer}
 .q-indicator.current{outline:2px solid #4f46e5;outline-offset:1px}
 .q-indicators{display:flex;flex-wrap:wrap;gap:4px;padding:12px 16px;background:#fff;
 border-bottom:1px solid #e2e8f0}
+.slug-list{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
+.slug-chip{background:#fff;border:1.5px solid #e2e8f0;border-radius:20px;
+padding:6px 14px;font-size:12px;font-weight:600;color:#4f46e5;text-decoration:none;
+cursor:pointer}
+.slug-chip:hover{background:#eef2ff;border-color:#4f46e5}
 """
 
 
@@ -617,7 +685,7 @@ def shell(title: str, body: str) -> str:
 <title>{esc(title)} · Testbook Mirror</title><style>{CSS}</style></head><body>
 <div class="topbar"><h1>📚 Testbook Mirror</h1>
 <div class="nav"><a href="/dashboard">🏠 Home</a>
-<a href="/online-test-series">📝 Series</a>
+<a href="/online-test-series">📝 All Series</a>
 <a href="/search">🔍 Search</a>
 <a href="/raw">🐛 Raw</a>
 <a href="/logout">Logout</a></div></div>
@@ -657,7 +725,7 @@ __ERROR__
 # ---------- Routes ----------
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "37.0.0"}
+    return {"status": "ok", "version": "38.0.0"}
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -701,49 +769,26 @@ async def dashboard(session_cookie: Optional[str] = Cookie(None, alias="tb_sessi
     token = get_token(session_cookie)
     if not token:
         return RedirectResponse("/", status_code=302)
+
     user = get_user_info(token)
     stats = await fetch_stats(token)
     agg = await fetch_enrolled_and_recent(token)
 
-    if not agg["enrolled_series"]:
-        fallback = []
-        for slug in ("rrb-group-d", "bihar-police-si", "ssc-cgl"):
-            fallback.extend(await fetch_series_list(token, slug))
-        agg["enrolled_series"] = fallback[:12]
-
+    # Stats
     stats_html = ""
     if stats:
         stats_html = f"""<div class="stat-row">
         <div class="stat"><div class="num">{stats.get('testsCount',0)}</div><div class="lbl">Tests</div></div>
         <div class="stat"><div class="num">{stats.get('quizzesCount',0)}</div><div class="lbl">Quizzes</div></div>
         <div class="stat"><div class="num">{stats.get('videosCount',0)}</div><div class="lbl">Videos</div></div>
-        <div class="stat"><div class="num">{len(agg['enrolled_series'])}</div><div class="lbl">Series</div></div>
         </div>"""
 
     paid_badge = " 💎" if user.get("isPaid") else ""
     greeting = f'<div class="info-box">✅ <b>Welcome, {esc(user["name"])}{paid_badge}!</b><br>{esc(user["email"])}</div>'
 
-    series_cards = ""
-    for s in agg["enrolled_series"][:12]:
-        title = _clean_text(s.get("title") or "Test Series")
-        total = s.get("totalTests") or 0
-        att = s.get("attempted") or 0
-        pct = int((att / total) * 100) if total else 0
-        series_cards += f"""
-        <div class="series-card">
-          <a href="/series?id={quote(s['id'], safe='')}">
-            <h3>{esc(title)}</h3>
-            <div class="progress-row">
-              <span>{att}/{total if total else '—'}</span>
-              <span>{pct}%</span>
-            </div>
-            <div class="progress-bar"><div class="fill" style="width:{pct}%"></div></div>
-            <div class="btn-go">Go To Test Series</div>
-          </a>
-        </div>"""
-
+    # Live tests
     live_cards = ""
-    for t in agg["live_tests"][:10]:
+    for t in agg["live_tests"][:12]:
         meta = []
         if t.get("questionCount"):
             meta.append(f"📝 {t['questionCount']} Qs")
@@ -758,24 +803,36 @@ async def dashboard(session_cookie: Optional[str] = Cookie(None, alias="tb_sessi
           <span class="badge green">Start Test →</span>
         </a></div>"""
 
-    search_html = """
-    <form class="search-box" method="get" action="/search">
-      <input type="text" name="q" placeholder="Search for your Exam" />
-      <button type="submit">Search</button>
-    </form>"""
+    # Manual exam slug entry
+    slug_form = """
+    <div class="section-title">🎯 Exam Slug Se Test Series Kholo</div>
+    <div class="info-box">
+      <b>Kaise pata karein apna exam slug?</b><br>
+      Testbook URL dekho: <code>testbook.com/<b>ssc-mts</b>/test-series/my</code><br>
+      Yahan <b>ssc-mts</b> hi aapka exam slug hai. Neeche daal ke Enter karo.
+    </div>
+    <form class="search-box" method="get" action="/exam">
+      <input type="text" name="slug" placeholder="e.g. ssc-mts, ssc-cgl, rrb-group-d" required>
+      <button type="submit">Open Exam →</button>
+    </form>
+    <div class="slug-list">
+      <span style="font-size:12px;color:#718096;margin-right:8px">Quick:</span>
+    """
+
+    for s in ["ssc-mts", "ssc-cgl", "ssc-chsl", "ssc-gd", "rrb-group-d", "rrb-ntpc", "bihar-police-si", "ibps-po"]:
+        slug_form += f'<a class="slug-chip" href="/exam?slug={quote(s)}">{s}</a>'
+    slug_form += "</div>"
 
     body = f"""<div class="container">
     {greeting}
     {stats_html}
-    {search_html}
 
-    {f'<div class="section-title">📚 Your Enrolled Test Series <a href="/online-test-series">View all →</a></div>' if series_cards else ''}
-    <div class="row">{series_cards}</div>
+    {slug_form}
 
-    {f'<div class="section-title">⚡ Live Tests & Free Quizzes <a href="/online-test-series">View All →</a></div>' if live_cards else ''}
+    {f'<div class="section-title">⚡ Live Tests & Free Quizzes</div>' if live_cards else ''}
     <div class="row">{live_cards}</div>
 
-    {f'<div class="empty"><h2>😕 Koi enrolled series nahi mili</h2><p>Token sahi hai (stats aa gaye), par series endpoints ne data nahi diya. <a href="/raw">Raw Debug</a> kholo aur screenshot bhejo.</p></div>' if not series_cards and not live_cards else ''}
+    {f'<div class="empty"><h2>😕 Koi enrolled series nahi mili</h2><p>Upar exam slug daal ke dekho — e.g. <b>ssc-mts</b>. Ya <a href="/raw">Raw Debug</a> kholo.</p></div>' if not live_cards else ''}
     </div>"""
     return HTMLResponse(shell("Dashboard", body))
 
@@ -786,31 +843,108 @@ async def online_test_series(session_cookie: Optional[str] = Cookie(None, alias=
     if not token:
         return RedirectResponse("/", status_code=302)
 
-    agg = await fetch_enrolled_and_recent(token)
-    all_series = agg["enrolled_series"]
-
-    if not all_series:
-        for slug in ("rrb-group-d", "bihar-police-si", "ssc-cgl", "rrb-ntpc", "ibps-po"):
-            all_series.extend(await fetch_series_list(token, slug))
+    # Try common exams
+    all_series = []
+    seen = set()
+    for slug in ["ssc-mts", "ssc-cgl", "ssc-chsl", "ssc-gd", "rrb-group-d", "rrb-ntpc"]:
+        r = await fetch_series_for_exam(token, slug)
+        for s in r["series"]:
+            if s["id"] not in seen:
+                seen.add(s["id"])
+                s["_exam"] = slug
+                all_series.append(s)
 
     cards = ""
-    for item in all_series:
-        desc_html = ""
-        if item.get("description"):
-            desc_html = f'<p>{esc(_clean_text(item.get("description"))[:140])}</p>'
+    for item in all_series[:60]:
+        access_badge = ""
+        if item.get("hasAccess"):
+            access_badge = '<span class="badge green">✓ Access</span>'
+        elif item.get("isFree"):
+            access_badge = '<span class="badge">Free</span>'
+        else:
+            access_badge = '<span class="badge orange">Paid</span>'
         cards += (
             f'<div class="card"><a href="/series?id={quote(item["id"], safe="")}">'
             f'<h3>{esc(_clean_text(item["title"]))}</h3>'
-            f'{desc_html}'
-            f'<span class="badge">Open Series →</span></a></div>'
+            f'{f"<p>{esc(_clean_text(item.get(chr(100)+chr(101)+chr(115)+chr(99)+chr(114)+chr(105)+chr(112)+chr(116)+chr(105)+chr(111)+chr(110), ""))[:140])}</p>" if item.get("description") else ""}'
+            f'{access_badge}'
+            f'<span class="badge">Open →</span></a></div>'
         )
 
     body = f"""<div class="container">
     <a href="/dashboard" class="back-btn">← Back</a>
-    <div class="info-box"><b>📝 Online Test Series ({len(all_series)})</b></div>
-    <div class="row">{cards if cards else '<div class="empty"><h2>Series load nahi hui</h2></div>'}</div>
+    <div class="info-box"><b>📝 Online Test Series ({len(all_series)})</b><br>Common exams se auto-fetched.</div>
+    <div class="row">{cards if cards else '<div class="empty"><h2>Series load nahi hui</h2><p>Exam slug se try karo.</p></div>'}</div>
     </div>"""
     return HTMLResponse(shell("Test Series", body))
+
+
+@app.get("/exam", response_class=HTMLResponse)
+async def exam_page(slug: str = Query(...), session_cookie: Optional[str] = Cookie(None, alias="tb_session")):
+    token = get_token(session_cookie)
+    if not token:
+        return RedirectResponse("/", status_code=302)
+
+    r = await fetch_series_for_exam(token, slug)
+    series = r["series"]
+    tests = r["tests"]
+
+    title = slug.replace("-", " ").title()
+
+    series_cards = ""
+    for item in series:
+        access_badge = ""
+        if item.get("hasAccess"):
+            access_badge = '<span class="badge green">✓ Access</span>'
+        elif item.get("isFree"):
+            access_badge = '<span class="badge">Free</span>'
+        else:
+            access_badge = '<span class="badge orange">Paid</span>'
+
+        prog_html = ""
+        if item.get("totalTests"):
+            pct = int((item["attempted"] / item["totalTests"]) * 100) if item["totalTests"] else 0
+            prog_html = f"""
+            <div class="progress-row"><span>{item['attempted']}/{item['totalTests']}</span><span>{pct}%</span></div>
+            <div class="progress-bar"><div class="fill" style="width:{pct}%"></div></div>"""
+
+        series_cards += f"""
+        <div class="series-card">
+          <a href="/series?id={quote(item['id'], safe='')}">
+            <h3>{esc(item['title'])}</h3>
+            {prog_html}
+            {access_badge}
+            <div class="btn-go">Go To Test Series</div>
+          </a>
+        </div>"""
+
+    # Standalone tests
+    test_cards = ""
+    for t in tests[:20]:
+        meta = []
+        if t.get("questionCount"):
+            meta.append(f"📝 {t['questionCount']} Qs")
+        if t.get("duration"):
+            meta.append(f"⏱ {t['duration']} min")
+        test_cards += f"""
+        <div class="card"><a href="/test?id={quote(t['id'], safe='')}&name={quote(t['title'], safe='')}">
+          <h3>{esc(t['title'])}</h3><p>{' · '.join(meta)}</p>
+          <span class="badge green">Start Test →</span></a></div>"""
+
+    debug_info = ""
+    if r["hits"]:
+        debug_info = f'<div class="info-box" style="font-size:11px">✅ Endpoints hit: {", ".join(h["url"].replace(API_BASE, "") for h in r["hits"])}</div>'
+
+    body = f"""<div class="container">
+    <a href="/dashboard" class="back-btn">← Back</a>
+    <div class="info-box"><b>📖 {esc(title)}</b> — exam slug: <code>{esc(slug)}</code><br>{len(series)} series · {len(tests)} standalone tests</div>
+    {debug_info}
+
+    {f'<div class="section-title">📚 Test Series ({len(series)})</div><div class="row">{series_cards}</div>' if series_cards else ''}
+    {f'<div class="section-title">⚡ Standalone Tests ({len(tests)})</div><div class="row">{test_cards}</div>' if test_cards else ''}
+    {f'<div class="empty"><h2>Is exam me kuch nahi mila</h2><p>Slug galat ho sakta hai. <a href="/raw?custom=/api/v2_1/test-series?exam={quote(slug)}">Raw se check karo →</a></p></div>' if not series_cards and not test_cards else ''}
+    </div>"""
+    return HTMLResponse(shell(title, body))
 
 
 @app.get("/search", response_class=HTMLResponse)
@@ -822,23 +956,15 @@ async def search_page(q: str = Query(""), session_cookie: Optional[str] = Cookie
     results = []
     if q:
         q_lower = q.lower()
-        agg = await fetch_enrolled_and_recent(token)
-        for s in agg["enrolled_series"]:
-            if q_lower in s["title"].lower():
-                results.append({"title": s["title"], "link": f'/series?id={quote(s["id"], safe="")}',
-                                "type": "Enrolled Series"})
-        for ex in (("RRB Group D", "rrb-group-d"), ("RRB NTPC", "rrb-ntpc"),
-                   ("SSC CGL", "ssc-cgl"), ("SSC GD", "ssc-gd"),
-                   ("Bihar Police SI", "bihar-police-si"), ("UP Police", "up-police"),
-                   ("IBPS PO", "ibps-po"), ("SBI PO", "sbi-po")):
-            if q_lower in ex[0].lower() or q_lower in ex[1].lower():
-                results.append({"title": ex[0], "link": f"/exam/{ex[1]}", "type": "Exam"})
-        for ex in (("RRB Group D", "rrb-group-d"), ("Bihar Police SI", "bihar-police-si")):
-            series = await fetch_series_list(token, ex[1])
-            for s in series:
-                if q_lower in s["title"].lower():
+        slug = title_to_slug(q)
+        # Try as exam slug
+        for ex_slug in [q_lower, slug]:
+            r = await fetch_series_for_exam(token, ex_slug)
+            for s in r["series"]:
+                if q_lower in s["title"].lower() or ex_slug in s.get("_exam", ""):
                     results.append({"title": s["title"], "link": f'/series?id={quote(s["id"], safe="")}',
-                                    "type": f"Series ({ex[0]})"})
+                                    "type": f"Series ({ex_slug})"})
+        # Dedupe
         seen = set()
         uniq = []
         for r in results:
@@ -855,39 +981,15 @@ async def search_page(q: str = Query(""), session_cookie: Optional[str] = Cookie
 
     body = f"""<div class="container">
     <a href="/dashboard" class="back-btn">← Back</a>
-    <div class="info-box"><b>🔍 Search</b></div>
+    <div class="info-box"><b>🔍 Search</b> — exam slug ya series title</div>
     <form class="search-box" method="get" action="/search">
-      <input type="text" name="q" value="{esc(q)}" placeholder="Search for your Exam" autofocus>
+      <input type="text" name="q" value="{esc(q)}" placeholder="ssc-mts, SSC CGL, RRB..." autofocus>
       <button type="submit">Search</button>
     </form>
-    {f'<div class="section-title">{len(results)} results found</div>' if q else ''}
+    {f'<div class="section-title">{len(results)} results</div>' if q else ''}
     <div class="row">{cards}</div>
     </div>"""
     return HTMLResponse(shell("Search", body))
-
-
-@app.get("/exam/{slug}", response_class=HTMLResponse)
-async def exam_page(slug: str, session_cookie: Optional[str] = Cookie(None, alias="tb_session")):
-    token = get_token(session_cookie)
-    if not token:
-        return RedirectResponse("/", status_code=302)
-
-    series = await fetch_series_list(token, slug)
-    title = slug.replace("-", " ").title()
-
-    cards = "".join(
-        f'<div class="card"><a href="/series?id={quote(item["id"], safe="")}">'
-        f'<h3>{esc(_clean_text(item["title"]))}</h3>'
-        f'<span class="badge">Open Series →</span></a></div>'
-        for item in series
-    )
-
-    body = f"""<div class="container">
-    <a href="/dashboard" class="back-btn">← Back</a>
-    <div class="info-box"><b>📖 {esc(title)}</b><br>{len(series)} test series</div>
-    <div class="row">{cards if cards else '<div class="empty"><h2>Is exam ke liye series nahi mili</h2></div>'}</div>
-    </div>"""
-    return HTMLResponse(shell(title, body))
 
 
 @app.get("/series", response_class=HTMLResponse)
@@ -922,7 +1024,7 @@ async def series_page(id: str = Query(...),
           document.getElementById('loading').style.display = 'none';
           const box = document.getElementById('results');
           if (!data.tests || data.tests.length === 0) {{
-            box.innerHTML = '<div class="empty"><h2>😕 Tests nahi mile</h2><p><a href="/raw">Raw debug kholo</a></p></div>';
+            box.innerHTML = '<div class="empty"><h2>😕 Tests nahi mile</h2><p><a href="/raw">Raw debug →</a></p></div>';
             return;
           }}
           let html = '<div class="section-title">📝 Tests (' + data.tests.length + ')</div><div class="row">';
@@ -1064,7 +1166,7 @@ async def test_page(id: str = Query(...), name: str = Query(""),
       }}
 
       function clearResponse() {{ delete window.__answers[window.__current]; renderCurrentQuestion(); }}
-      function markForReview() {{ alert('Marked for review (visual indicator coming soon)'); }}
+      function markForReview() {{ alert('Marked'); }}
       function saveAndNext() {{ if (window.__current < window.__questions.length - 1) {{ window.__current++; renderCurrentQuestion(); window.scrollTo({{top:0,behavior:'smooth'}}); }} }}
       function prevQuestion() {{ if (window.__current > 0) {{ window.__current--; renderCurrentQuestion(); window.scrollTo({{top:0,behavior:'smooth'}}); }} }}
       function jumpTo(i) {{ window.__current = i; renderCurrentQuestion(); window.scrollTo({{top:0,behavior:'smooth'}}); }}
@@ -1138,13 +1240,14 @@ async def api_test_questions(id: str = Query(...),
     try:
         result = await asyncio.wait_for(fetch_test_questions(token, id), timeout=25.0)
         return {"questions": result["questions"], "count": len(result["questions"]),
-                "test_info": result.get("test_info"), "error": result.get("error")}
+                "test_info": result.get("test_info"), "error": result.get("error"),
+                "endpoint_used": result.get("endpoint_used")}
     except Exception as e:
         return {"questions": [], "error": str(e)}
 
 
 # ============================================================
-# 🐛 RAW DATA VIEWER  —  /raw, /raw?ep=, /raw?custom=, /raw/full
+# 🐛 RAW DATA VIEWER
 # ============================================================
 
 def _validate_raw_url(url: str) -> Optional[str]:
@@ -1209,20 +1312,34 @@ async def api_raw_probe_all(session_cookie: Optional[str] = Cookie(None, alias="
     if not token:
         return JSONResponse({"error": "not logged in", "results": []}, status_code=401)
 
+    user = get_user_info(token)
+    slugs = await discover_exam_slugs(token)
+
+    # Test a few key endpoints per slug
+    endpoints = []
+    for slug in slugs[:6]:
+        endpoints.append(f"/api/v2_1/test-series?exam={slug}")
+        endpoints.append(f"/api/v2_1/test-series?exam={slug}&my=true")
+    endpoints += [
+        "/api/v2_1/live-panel/all",
+        "/api/v2_1/live-panel/count",
+        "/api/v2_1/test-series",
+        f"/api/v2_1/users/{user['userId']}/test-series",
+    ]
+
     async def one(ep):
         d = await _diagnose(token, ep, timeout=10.0)
         return {
-            "endpoint": ep,
-            "status": d.get("status"),
+            "endpoint": ep, "status": d.get("status"),
             "response_size": d.get("response_size", 0),
             "elapsed_ms": d.get("elapsed_ms"),
             "detected": {"series": d.get("series", []), "tests": d.get("tests", [])},
             "error": d.get("error"),
         }
 
-    results = await asyncio.gather(*[one(ep) for ep in ENROLLED_ENDPOINTS], return_exceptions=True)
+    results = await asyncio.gather(*[one(ep) for ep in endpoints], return_exceptions=True)
     clean = [r for r in results if isinstance(r, dict)]
-    return {"results": clean, "count": len(clean)}
+    return {"results": clean, "count": len(clean), "exam_slugs_tried": slugs[:6]}
 
 
 @app.get("/api/raw/one")
@@ -1240,16 +1357,30 @@ async def raw_full(session_cookie: Optional[str] = Cookie(None, alias="tb_sessio
     if not token:
         return RedirectResponse("/", status_code=302)
 
+    user = get_user_info(token)
+    slugs = await discover_exam_slugs(token)
+
     async def one(ep):
         d = await _diagnose(token, ep, timeout=12.0)
         d.pop("body_text", None)
         return d
 
-    results = await asyncio.gather(*[one(ep) for ep in ENROLLED_ENDPOINTS], return_exceptions=True)
+    # Key endpoints
+    endpoints = [
+        "/api/v2_1/live-panel/all",
+        "/api/v2_1/live-panel/count",
+        f"/api/v2_1/users/{user['userId']}/test-series",
+        "/api/v2_1/test-series",
+    ]
+    for slug in slugs[:5]:
+        endpoints.append(f"/api/v2_1/test-series?exam={slug}")
+
+    results = await asyncio.gather(*[one(ep) for ep in endpoints], return_exceptions=True)
     payload = {
         "generated_at": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
-        "user": get_user_info(token),
-        "endpoints_tried": len(ENROLLED_ENDPOINTS),
+        "user": user,
+        "exam_slugs_tried": slugs,
+        "endpoints_tried": len(endpoints),
         "results": [r for r in results if isinstance(r, dict)],
     }
     return JSONResponse(payload, headers={
@@ -1264,6 +1395,8 @@ async def raw_page(ep: Optional[str] = Query(None),
     token = get_token(session_cookie)
     if not token:
         return RedirectResponse("/", status_code=302)
+
+    user = get_user_info(token)
 
     target = ep or custom
     if target:
@@ -1283,11 +1416,11 @@ async def raw_page(ep: Optional[str] = Query(None),
         if d.get("series"):
             series_summary = f'<div class="section-title">✅ Detected as SERIES ({len(d["series"])})</div>'
             for s in d["series"][:20]:
-                series_summary += f'<div class="card"><h3>{esc(s["title"])}</h3><p>id={esc(s["id"])} · total={s["totalTests"]} · attempted={s["attempted"]}</p><span class="badge">Detected Series</span></div>'
+                series_summary += f'<div class="card"><h3>{esc(s["title"])}</h3><p>id={esc(s["id"])} · access={s.get("hasAccess")}</p><span class="badge">Series</span></div>'
         if d.get("tests"):
             series_summary += f'<div class="section-title">✅ Detected as TESTS ({len(d["tests"])})</div>'
             for t in d["tests"][:20]:
-                series_summary += f'<div class="card"><h3>{esc(t["title"])}</h3><p>id={esc(t["id"])} · qs={t["questionCount"]}</p><span class="badge green">Detected Test</span></div>'
+                series_summary += f'<div class="card"><h3>{esc(t["title"])}</h3><p>id={esc(t["id"])}</p><span class="badge green">Test</span></div>'
 
         headers_html = "".join(
             f"<tr><td style='padding:4px 10px;font-family:monospace;color:#718096'>{esc(k)}</td>"
@@ -1297,10 +1430,8 @@ async def raw_page(ep: Optional[str] = Query(None),
 
         body = f"""<div class="container">
         <a href="/raw" class="back-btn">← All Endpoints</a>
-        <div class="info-box">
-          <b>🔍 Raw Response</b><br>
-          <code style="font-size:11px;word-break:break-all">{esc(d['url'])}</code>
-        </div>
+        <div class="info-box"><b>🔍 Raw Response</b><br>
+          <code style="font-size:11px;word-break:break-all">{esc(d['url'])}</code></div>
         <div class="stat-row">
           <div class="stat"><div class="num">{status_badge}</div><div class="lbl">Status</div></div>
           <div class="stat"><div class="num">{d.get('response_size',0)}</div><div class="lbl">Bytes</div></div>
@@ -1308,54 +1439,50 @@ async def raw_page(ep: Optional[str] = Query(None),
           <div class="stat"><div class="num">{len(d.get('series',[]))}</div><div class="lbl">Series</div></div>
           <div class="stat"><div class="num">{len(d.get('tests',[]))}</div><div class="lbl">Tests</div></div>
         </div>
-
         {series_summary}
-
         <div class="section-title">📄 Full Raw JSON
-          <a href="#" onclick="copyJson();return false;">📋 Copy</a>
-        </div>
+          <a href="#" onclick="copyJson();return false;">📋 Copy</a></div>
         <textarea id="jsonBox" style="width:100%;min-height:400px;padding:14px;border-radius:10px;border:1.5px solid #e2e8f0;font-family:monospace;font-size:11px;background:#1a202c;color:#a0aec0;resize:vertical">{json_escaped}</textarea>
-
         <div class="section-title">📨 Response Headers</div>
-        <table style="width:100%;background:#fff;border-radius:10px;font-size:12px;border-collapse:collapse">{headers_html or '<tr><td style="padding:10px;color:#a0aec0">No headers captured</td></tr>'}</table>
-
+        <table style="width:100%;background:#fff;border-radius:10px;font-size:12px;border-collapse:collapse">{headers_html or '<tr><td style="padding:10px;color:#a0aec0">No headers</td></tr>'}</table>
         <div style="margin-top:20px;display:flex;gap:8px;flex-wrap:wrap">
           <a href="/raw?ep={quote(d['url'], safe='')}" class="btn">🔄 Refresh</a>
-          <a href="/raw/full" class="btn" style="background:#10b981">📥 Download ALL endpoints</a>
+          <a href="/raw/full" class="btn" style="background:#10b981">📥 Download ALL</a>
         </div>
-
         <script>
           function copyJson() {{
             const t = document.getElementById('jsonBox');
             t.select(); t.setSelectionRange(0, 99999);
             navigator.clipboard.writeText(t.value);
-            alert('JSON copied — paste anywhere.');
+            alert('JSON copied');
           }}
-        </script>
-        </div>"""
+        </script></div>"""
         return HTMLResponse(shell(f"Raw · {target[:40]}", body))
 
     body = f"""<div class="container">
     <a href="/dashboard" class="back-btn">← Dashboard</a>
     <div class="info-box">
       <b>🐛 Raw Data Viewer</b><br>
-      Yahan se dekh sakte hain ki Testbook API actually kya bhej raha hai.
-      Agar data nahi aa raha, yahan dikhega <b>kaunsa endpoint 200/403/empty hai</b>.
+      User: {esc(user['name'])} · isPaid: {user['isPaid']} · userId: {esc(user['userId'])}<br>
+      Yahan dikhega kaunsa endpoint actually data de raha hai.
     </div>
 
-    <div class="section-title">🌐 Custom Endpoint Try Karein</div>
+    <div class="section-title">🌐 Custom Endpoint</div>
     <form class="search-box" method="get" action="/raw">
-      <input type="text" name="custom" placeholder="/api/v2_1/users/me/purchases" required>
+      <input type="text" name="custom" placeholder="/api/v2_1/test-series?exam=ssc-mts" required>
       <button type="submit">Fetch →</button>
     </form>
 
-    <div class="section-title">📡 All Known Endpoints — Live Probe ({len(ENROLLED_ENDPOINTS)})</div>
-    <p style="color:#718096;font-size:12px;margin-bottom:12px">
-      Ye list har endpoint ko real-time call karke result dikhati hai.
-      ✅ = data mila, ⚠️ = 200 lekin empty, ❌ = error.
-    </p>
+    <div class="section-title">🎯 Exam Slug Test</div>
+    <form class="search-box" method="get" action="/raw">
+      <input type="text" name="ep" value="/api/v2_1/test-series?exam=ssc-mts" placeholder="/api/v2_1/test-series?exam=ssc-mts">
+      <button type="submit">Test Slug →</button>
+    </form>
+
+    <div class="section-title">📡 Live Probe</div>
+    <p style="color:#718096;font-size:12px;margin-bottom:12px">✅ = data mila, ⚠️ = empty, ❌ = error.</p>
     <div id="endpointList">
-      <div class="loading-box"><div class="spinner"></div><p>Probing {len(ENROLLED_ENDPOINTS)} endpoints...</p></div>
+      <div class="loading-box"><div class="spinner"></div><p>Probing endpoints...</p></div>
     </div>
 
     <div style="margin-top:20px;display:flex;gap:8px;flex-wrap:wrap">
@@ -1372,12 +1499,9 @@ async def raw_page(ep: Optional[str] = Query(None),
         }}
         let html = '<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;background:#fff;border-radius:12px;font-size:12px;box-shadow:0 2px 8px rgba(0,0,0,.06)">';
         html += '<tr style="background:#eef2ff;text-align:left">'
-          + '<th style="padding:10px">Status</th>'
-          + '<th style="padding:10px">Endpoint</th>'
-          + '<th style="padding:10px">Size</th>'
-          + '<th style="padding:10px">Series</th>'
-          + '<th style="padding:10px">Tests</th>'
-          + '<th style="padding:10px">Action</th></tr>';
+          + '<th style="padding:10px">Status</th><th style="padding:10px">Endpoint</th>'
+          + '<th style="padding:10px">Size</th><th style="padding:10px">Series</th>'
+          + '<th style="padding:10px">Tests</th><th style="padding:10px">Action</th></tr>';
         for (const r of data.results) {{
           const st = r.status;
           const statusColor = st === 200 ? '#10b981' : (st >= 400 ? '#ef4444' : '#f59e0b');
@@ -1408,7 +1532,6 @@ async def raw_page(ep: Optional[str] = Query(None),
     return HTMLResponse(shell("Raw Debug", body))
 
 
-# ---------- Old debug/probe (kept for compatibility) ----------
 @app.get("/debug/probe", response_class=HTMLResponse)
 async def probe(session_cookie: Optional[str] = Cookie(None, alias="tb_session")):
     token = get_token(session_cookie)
